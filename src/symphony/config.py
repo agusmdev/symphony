@@ -52,6 +52,7 @@ class AgentConfig:
     max_turns: int = 20
     max_retry_backoff_ms: int = 300_000
     max_concurrent_agents_by_state: Mapping[str, int] = field(default_factory=dict)
+    harness: str = "codex"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,14 @@ class CodexConfig:
     approval_policy: str | None = None
     thread_sandbox: str | None = None
     turn_sandbox_policy: str | None = None
+    turn_timeout_ms: int = 3_600_000
+    read_timeout_ms: int = 5_000
+    stall_timeout_ms: int = 300_000
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeConfig:
+    command: str = "claude -p"
     turn_timeout_ms: int = 3_600_000
     read_timeout_ms: int = 5_000
     stall_timeout_ms: int = 300_000
@@ -78,6 +87,7 @@ class ServiceConfig:
     hooks: HooksConfig
     agent: AgentConfig
     codex: CodexConfig
+    claude: ClaudeConfig
     server: ServerConfig
 
     @property
@@ -95,8 +105,18 @@ class ServiceConfig:
             raise ConfigError("missing_tracker_api_key", "tracker.api_key is required")
         if not self.tracker.project_slug:
             raise ConfigError("missing_tracker_project_slug", "tracker.project_slug is required")
-        if not self.codex.command.strip():
+        if self.agent.harness not in {"codex", "claude"}:
+            raise ConfigError("unsupported_agent_harness", "agent.harness must be codex or claude")
+        if self.agent.harness == "codex" and not self.codex.command.strip():
             raise ConfigError("missing_codex_command", "codex.command is required")
+        if self.agent.harness == "claude" and not self.claude.command.strip():
+            raise ConfigError("missing_claude_command", "claude.command is required")
+
+    @property
+    def harness_stall_timeout_ms(self) -> int:
+        if self.agent.harness == "claude":
+            return self.claude.stall_timeout_ms
+        return self.codex.stall_timeout_ms
 
 
 def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None) -> ServiceConfig:
@@ -107,6 +127,7 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
     hooks = _mapping(root.get("hooks"))
     agent = _mapping(root.get("agent"))
     codex = _mapping(root.get("codex"))
+    claude = _mapping(root.get("claude"))
     server = _mapping(root.get("server"))
 
     kind = _optional_str(tracker.get("kind"))
@@ -144,6 +165,7 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
             max_concurrent_agents_by_state=_state_limits(
                 agent.get("max_concurrent_agents_by_state")
             ),
+            harness=_str(agent.get("harness"), "codex"),
         ),
         codex=CodexConfig(
             command=_str(codex.get("command"), "codex app-server"),
@@ -153,6 +175,12 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
             turn_timeout_ms=_positive_int(codex.get("turn_timeout_ms"), 3_600_000),
             read_timeout_ms=_positive_int(codex.get("read_timeout_ms"), 5_000),
             stall_timeout_ms=_int(codex.get("stall_timeout_ms"), 300_000),
+        ),
+        claude=ClaudeConfig(
+            command=_str(claude.get("command"), "claude -p"),
+            turn_timeout_ms=_positive_int(claude.get("turn_timeout_ms"), 3_600_000),
+            read_timeout_ms=_positive_int(claude.get("read_timeout_ms"), 5_000),
+            stall_timeout_ms=_int(claude.get("stall_timeout_ms"), 300_000),
         ),
         server=ServerConfig(port=_optional_int(server.get("port"))),
     )

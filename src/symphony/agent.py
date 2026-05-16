@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from symphony.config import ServiceConfig
 from symphony.errors import AgentError
@@ -14,6 +15,18 @@ from symphony.tracker import IssueTracker
 from symphony.workspace import WorkspaceManager, ensure_inside_root
 
 AgentEventCallback = Callable[[str, JsonObject], Awaitable[None]]
+
+
+class AgentClient(Protocol):
+    async def run_turn(
+        self,
+        *,
+        workspace: Path,
+        issue: Issue,
+        prompt: str,
+        turn_number: int,
+        on_event: AgentEventCallback,
+    ) -> None: ...
 
 
 class CodexAppServerClient:
@@ -120,18 +133,118 @@ class CodexAppServerClient:
                 raise AgentError(event, f"Codex event {event}")
 
 
+class ClaudePrintClient:
+    def __init__(self, config: ServiceConfig) -> None:
+        self._config = config
+
+    async def run_turn(
+        self,
+        *,
+        workspace: Path,
+        issue: Issue,
+        prompt: str,
+        turn_number: int,
+        on_event: AgentEventCallback,
+    ) -> None:
+        ensure_inside_root(self._config.workspace.root, workspace)
+        command = f"{self._config.claude.command} {shlex.quote(prompt)}"
+        proc = await asyncio.create_subprocess_exec(
+            "bash",
+            "-lc",
+            command,
+            cwd=workspace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        if proc.stdout is None:
+            raise AgentError("port_exit", "failed to open Claude stdout")
+        await on_event(
+            "session_started",
+            {
+                "event": "session_started",
+                "timestamp": utc_now().isoformat(),
+                "agent_process_pid": str(proc.pid),
+                "claude_process_pid": str(proc.pid),
+                "thread_id": f"{issue.id}",
+                "turn_id": str(turn_number),
+                "session_id": f"{issue.id}-{turn_number}",
+            },
+        )
+        try:
+            await asyncio.wait_for(
+                self._stream_until_done(proc, on_event),
+                self._config.claude.turn_timeout_ms / 1000,
+            )
+        except TimeoutError as exc:
+            proc.kill()
+            await proc.wait()
+            raise AgentError("turn_timeout", "Claude turn timed out") from exc
+        finally:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+
+    async def _stream_until_done(
+        self,
+        proc: asyncio.subprocess.Process,
+        on_event: AgentEventCallback,
+    ) -> None:
+        assert proc.stdout is not None
+        stderr_task = None
+        if proc.stderr is not None:
+            stderr_task = asyncio.create_task(proc.stderr.read())
+        while True:
+            try:
+                line = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=self._config.claude.read_timeout_ms / 1000
+                )
+            except TimeoutError:
+                if proc.returncode is not None:
+                    line = b""
+                else:
+                    await on_event(
+                        "heartbeat",
+                        {"event": "heartbeat", "timestamp": utc_now().isoformat()},
+                    )
+                    continue
+            if not line:
+                rc = await proc.wait()
+                stderr = ""
+                if stderr_task is not None:
+                    stderr = (await stderr_task).decode(errors="replace").strip()
+                if rc == 0:
+                    await on_event(
+                        "turn_completed",
+                        {"event": "turn_completed", "timestamp": utc_now().isoformat()},
+                    )
+                    return
+                message = f"Claude harness exited rc={rc}"
+                if stderr:
+                    message = f"{message}: {stderr[-1000:]}"
+                raise AgentError("port_exit", message)
+            if len(line) > 10 * 1024 * 1024:
+                raise AgentError("response_error", "Claude protocol line exceeded 10MB")
+            text = line.decode(errors="replace").rstrip()
+            payload = _parse_claude_line(text)
+            await on_event(str(payload.get("event") or "message"), payload)
+
+
 class AgentRunner:
     def __init__(
         self,
         config: ServiceConfig,
         workspace_manager: WorkspaceManager,
         tracker: IssueTracker,
-        client: CodexAppServerClient | None = None,
+        client: AgentClient | None = None,
     ) -> None:
         self._config = config
         self._workspace_manager = workspace_manager
         self._tracker = tracker
-        self._client = client or CodexAppServerClient(config)
+        self._client = client or _build_client(config)
 
     async def run(
         self,
@@ -181,3 +294,22 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_value(item) for key, item in value.items()}
     return str(value)
+
+
+def _build_client(config: ServiceConfig) -> AgentClient:
+    if config.agent.harness == "claude":
+        return ClaudePrintClient(config)
+    return CodexAppServerClient(config)
+
+
+def _parse_claude_line(text: str) -> JsonObject:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {"event": "message", "timestamp": utc_now().isoformat(), "text": text}
+    if not isinstance(payload, dict):
+        return {"event": "message", "timestamp": utc_now().isoformat(), "text": text}
+    result = _json_object(payload)
+    result.setdefault("event", str(payload.get("type") or "message"))
+    result.setdefault("timestamp", utc_now().isoformat())
+    return result

@@ -102,8 +102,8 @@ class Orchestrator:
             last = entry.live_session.last_codex_timestamp or entry.started_at
             elapsed_ms = (now - last).total_seconds() * 1000
             if (
-                self.config.codex.stall_timeout_ms > 0
-                and elapsed_ms > self.config.codex.stall_timeout_ms
+                self.config.harness_stall_timeout_ms > 0
+                and elapsed_ms > self.config.harness_stall_timeout_ms
             ):
                 await self._terminate(issue_id, cleanup_workspace=False, reason="stalled")
         ids = list(self.state.running)
@@ -201,7 +201,9 @@ class Orchestrator:
             live = entry.live_session
             live.last_codex_event = event
             live.last_codex_timestamp = utc_now()
-            live.codex_app_server_pid = _str_or_none(payload.get("codex_app_server_pid"))
+            live.codex_app_server_pid = _str_or_none(
+                payload.get("codex_app_server_pid") or payload.get("agent_process_pid")
+            )
             live.thread_id = _str_or_none(payload.get("thread_id")) or live.thread_id
             live.turn_id = _str_or_none(payload.get("turn_id")) or live.turn_id
             live.session_id = _str_or_none(payload.get("session_id")) or (

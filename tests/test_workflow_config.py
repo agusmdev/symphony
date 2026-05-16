@@ -43,6 +43,35 @@ def test_defaults_and_env_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyP
     config.validate_for_dispatch()
 
 
+def test_claude_harness_config() -> None:
+    definition = WorkflowDefinition(
+        config={
+            "tracker": {"kind": "linear", "api_key": "x", "project_slug": "proj"},
+            "agent": {"harness": "claude"},
+            "claude": {"command": "claude -p", "stall_timeout_ms": 123},
+        },
+        prompt_template="body",
+    )
+    config = build_config(definition)
+    assert config.agent.harness == "claude"
+    assert config.claude.command == "claude -p"
+    assert config.harness_stall_timeout_ms == 123
+    config.validate_for_dispatch()
+
+
+def test_unknown_harness_rejected() -> None:
+    definition = WorkflowDefinition(
+        config={
+            "tracker": {"kind": "linear", "api_key": "x", "project_slug": "proj"},
+            "agent": {"harness": "other"},
+        },
+        prompt_template="body",
+    )
+    config = build_config(definition)
+    with pytest.raises(SymphonyError, match="unsupported_agent_harness"):
+        config.validate_for_dispatch()
+
+
 def test_prompt_strict_unknown_variable() -> None:
     issue = Issue("id", "ABC-1", "Title", None, None, "Todo", None, None)
     with pytest.raises(SymphonyError, match="prompt_render_failed"):
