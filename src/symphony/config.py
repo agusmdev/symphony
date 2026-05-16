@@ -68,7 +68,7 @@ class CodexConfig:
 
 @dataclass(frozen=True, slots=True)
 class ClaudeConfig:
-    command: str = "claude -p"
+    command: str = "claude"
     turn_timeout_ms: int = 3_600_000
     read_timeout_ms: int = 5_000
     stall_timeout_ms: int = 300_000
@@ -177,7 +177,7 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
             stall_timeout_ms=_int(codex.get("stall_timeout_ms"), 300_000),
         ),
         claude=ClaudeConfig(
-            command=_str(claude.get("command"), "claude -p"),
+            command=_str(claude.get("command"), "claude"),
             turn_timeout_ms=_positive_int(claude.get("turn_timeout_ms"), 3_600_000),
             read_timeout_ms=_positive_int(claude.get("read_timeout_ms"), 5_000),
             stall_timeout_ms=_int(claude.get("stall_timeout_ms"), 300_000),

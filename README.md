@@ -10,8 +10,9 @@ command is `codex app-server`. Approval and sandbox fields are read from workflo
 to the generic JSON-lines app-server client when the configured server supports them.
 
 Claude Code can be used instead by selecting the Claude harness. The default Claude command is
-`claude -p`; Symphony appends the rendered prompt as the next shell-quoted argument and streams
-stdout back into the run state.
+`claude`; Symphony starts it in a detached tmux session, sends the rendered prompt on stdin, and
+streams the tmux log back into the run state. The `session_started` event includes a
+`tmux_attach_command` for operators who want to inspect the live session.
 
 ## Usage
 
@@ -34,5 +35,5 @@ Minimal Claude harness config:
 agent:
   harness: claude
 claude:
-  command: claude -p
+  command: claude
 ```

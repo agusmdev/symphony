@@ -48,13 +48,13 @@ def test_claude_harness_config() -> None:
         config={
             "tracker": {"kind": "linear", "api_key": "x", "project_slug": "proj"},
             "agent": {"harness": "claude"},
-            "claude": {"command": "claude -p", "stall_timeout_ms": 123},
+            "claude": {"command": "claude", "stall_timeout_ms": 123},
         },
         prompt_template="body",
     )
     config = build_config(definition)
     assert config.agent.harness == "claude"
-    assert config.claude.command == "claude -p"
+    assert config.claude.command == "claude"
     assert config.harness_stall_timeout_ms == 123
     config.validate_for_dispatch()
 

@@ -110,7 +110,7 @@ Use `agent.harness: claude` and a `claude` block when the repository should run 
 agent:
   harness: claude
 claude:
-  command: claude -p
+  command: claude
 ```
 
 Use a `codex` block when the repository needs non-default Codex settings:
