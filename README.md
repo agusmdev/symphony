@@ -21,6 +21,13 @@ uv run symphony ./WORKFLOW.md
 
 If no path is supplied, `./WORKFLOW.md` is used.
 
+To have an agent create a repository-specific workflow, ask it:
+
+```text
+Create a WORKFLOW.md for this repository following this guide:
+https://github.com/agusmdev/symphony/blob/main/docs/workflow-setup-guide.md
+```
+
 Minimal Claude harness config:
 
 ```yaml
