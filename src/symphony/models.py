@@ -31,6 +31,8 @@ class Issue:
     state: str
     branch_name: str | None
     url: str | None
+    assignee_id: str | None = None
+    assigned_to_worker: bool = True
     labels: list[str] = field(default_factory=list)
     blocked_by: list[BlockerRef] = field(default_factory=list)
     created_at: datetime | None = None

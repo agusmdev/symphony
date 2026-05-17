@@ -82,8 +82,37 @@ class Orchestrator:
             for issue in sort_for_dispatch(issues):
                 if self.available_slots() <= 0:
                     break
-                if self.should_dispatch(issue):
-                    self.dispatch_issue(issue, None)
+                if not self.should_dispatch(issue):
+                    continue
+                revalidated = await self._revalidate_for_dispatch(issue)
+                if revalidated is None:
+                    continue
+                self.dispatch_issue(revalidated, None)
+
+    async def _revalidate_for_dispatch(self, issue: Issue) -> Issue | None:
+        try:
+            refreshed = await self.tracker.fetch_issue_states_by_ids([issue.id])
+        except SymphonyError as exc:
+            LOG.warning(
+                "revalidate failed issue_id=%s code=%s message=%s",
+                issue.id,
+                exc.code,
+                exc.message,
+            )
+            return None
+        if not refreshed:
+            LOG.info("skip dispatch: issue not visible issue_id=%s", issue.id)
+            return None
+        current = refreshed[0]
+        if not self.should_dispatch(current):
+            LOG.info(
+                "skip stale dispatch issue_id=%s state=%s assigned=%s",
+                current.id,
+                current.state,
+                current.assigned_to_worker,
+            )
+            return None
+        return current
 
     async def startup_terminal_workspace_cleanup(self) -> None:
         try:
@@ -114,23 +143,35 @@ class Orchestrator:
         except SymphonyError as exc:
             LOG.debug("state_refresh failed code=%s message=%s", exc.code, exc.message)
             return
+        seen_ids: set[str] = set()
         for issue in refreshed:
+            seen_ids.add(issue.id)
             running_entry = self.state.running.get(issue.id)
             if running_entry is None:
                 continue
             state = issue.state.lower()
             if state in self.config.terminal_states_normalized:
                 await self._terminate(issue.id, cleanup_workspace=True, reason="terminal")
+            elif not issue.assigned_to_worker:
+                await self._terminate(issue.id, cleanup_workspace=False, reason="reassigned")
             elif state in self.config.active_states_normalized:
                 running_entry.issue = issue
             else:
                 await self._terminate(issue.id, cleanup_workspace=False, reason="non_active")
+        for issue_id in ids:
+            if issue_id in seen_ids:
+                continue
+            if issue_id not in self.state.running:
+                continue
+            await self._terminate(issue_id, cleanup_workspace=False, reason="vanished")
 
     def available_slots(self) -> int:
         return max(self.state.max_concurrent_agents - len(self.state.running), 0)
 
     def should_dispatch(self, issue: Issue) -> bool:
         if not issue.id or not issue.identifier or not issue.title or not issue.state:
+            return False
+        if not issue.assigned_to_worker:
             return False
         state = issue.state.lower()
         if state not in self.config.active_states_normalized:

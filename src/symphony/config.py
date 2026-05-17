@@ -11,7 +11,7 @@ from symphony.errors import ConfigError
 from symphony.models import WorkflowDefinition
 
 LINEAR_ENDPOINT = "https://api.linear.app/graphql"
-ACTIVE_STATES = ("Todo", "In Progress")
+ACTIVE_STATES = ("Todo", "In Progress", "Human Review", "Merging", "Rework")
 TERMINAL_STATES = ("Closed", "Cancelled", "Canceled", "Duplicate", "Done")
 
 
@@ -21,6 +21,7 @@ class TrackerConfig:
     endpoint: str
     api_key: str | None
     project_slug: str | None
+    assignee: str | None = None
     active_states: tuple[str, ...] = ACTIVE_STATES
     terminal_states: tuple[str, ...] = TERMINAL_STATES
 
@@ -135,6 +136,9 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
     api_key = _resolve_secret(_optional_str(tracker.get("api_key")))
     if api_key is None and kind == "linear":
         api_key = _empty_to_none(os.environ.get("LINEAR_API_KEY"))
+    assignee = _resolve_secret(_optional_str(tracker.get("assignee")))
+    if assignee is None and kind == "linear":
+        assignee = _empty_to_none(os.environ.get("LINEAR_ASSIGNEE"))
     workspace_root = _resolve_path(
         _str(workspace.get("root"), str(Path(tempfile.gettempdir(), "symphony_workspaces"))),
         base_dir=base_dir,
@@ -146,6 +150,7 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
             endpoint=endpoint,
             api_key=api_key,
             project_slug=_optional_str(tracker.get("project_slug")),
+            assignee=assignee,
             active_states=_str_tuple(tracker.get("active_states"), ACTIVE_STATES),
             terminal_states=_str_tuple(tracker.get("terminal_states"), TERMINAL_STATES),
         ),

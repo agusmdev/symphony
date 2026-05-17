@@ -86,3 +86,70 @@ def test_prompt_renders_issue_and_attempt() -> None:
 def test_select_default_workflow_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     assert select_workflow_path(None) == tmp_path / "WORKFLOW.md"
+
+
+def test_assignee_explicit_value() -> None:
+    definition = WorkflowDefinition(
+        config={
+            "tracker": {
+                "kind": "linear",
+                "api_key": "k",
+                "project_slug": "p",
+                "assignee": "user-id-42",
+            }
+        },
+        prompt_template="body",
+    )
+    config = build_config(definition)
+    assert config.tracker.assignee == "user-id-42"
+
+
+def test_assignee_env_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LINEAR_ASSIGNEE", "user-via-env")
+    definition = WorkflowDefinition(
+        config={"tracker": {"kind": "linear", "api_key": "k", "project_slug": "p"}},
+        prompt_template="body",
+    )
+    config = build_config(definition)
+    assert config.tracker.assignee == "user-via-env"
+
+
+def test_assignee_envref_in_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MY_ASSIGNEE", "user-via-ref")
+    definition = WorkflowDefinition(
+        config={
+            "tracker": {
+                "kind": "linear",
+                "api_key": "k",
+                "project_slug": "p",
+                "assignee": "$MY_ASSIGNEE",
+            }
+        },
+        prompt_template="body",
+    )
+    config = build_config(definition)
+    assert config.tracker.assignee == "user-via-ref"
+
+
+def test_assignee_unset_when_no_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LINEAR_ASSIGNEE", raising=False)
+    definition = WorkflowDefinition(
+        config={"tracker": {"kind": "linear", "api_key": "k", "project_slug": "p"}},
+        prompt_template="body",
+    )
+    config = build_config(definition)
+    assert config.tracker.assignee is None
+
+
+def test_default_active_states_include_human_review_and_merging() -> None:
+    definition = WorkflowDefinition(
+        config={"tracker": {"kind": "linear", "api_key": "k", "project_slug": "p"}},
+        prompt_template="body",
+    )
+    config = build_config(definition)
+    states = {s.lower() for s in config.tracker.active_states}
+    assert "todo" in states
+    assert "in progress" in states
+    assert "human review" in states
+    assert "merging" in states
+    assert "rework" in states

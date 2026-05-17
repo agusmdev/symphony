@@ -19,7 +19,18 @@ The file must contain:
 - A prompt body that tells the coding agent how to work on each tracker issue in this repository.
 - Repository-specific setup, verification, and delivery instructions.
 
+A complete reference workflow that implements the full multi-state Linear flow (Todo → In Progress → Human Review → Merging → Rework → Done) lives at [`examples/WORKFLOW.md`](../examples/WORKFLOW.md). Use it as a starting point when the repository wants the OpenAI-style ticket flow.
+
 Do not create a generic workflow. Inspect the repository first, then ask only the questions needed to fill gaps safely.
+
+## Linear access from the agent
+
+Symphony gives the agent authenticated Linear access via a `linear_graphql` tool that takes a GraphQL query/mutation document and optional variables. The wiring differs by harness; both expose the same tool name and schema, so the prompt body is identical:
+
+- **Codex harness** — Symphony registers `linear_graphql` as a Codex app-server dynamic tool. No setup required beyond `LINEAR_API_KEY`.
+- **Claude harness** — Symphony spawns a local stdio MCP server (`symphony-linear`) and configures Claude with `--mcp-config` pointing at it. `LINEAR_API_KEY` is forwarded into the MCP server's environment.
+
+The prompt body should reference the `linear_graphql` tool, not Codex-only details.
 
 ## Required Discovery
 

@@ -82,6 +82,18 @@ class EmptyTracker:
     async def fetch_issue_states_by_ids(self, issue_ids: list[str]) -> list[Issue]:
         return []
 
+    async def resolve_viewer_id(self) -> str | None:
+        return None
+
+    async def create_comment(self, issue_id: str, body: str) -> None:
+        return None
+
+    async def update_issue_state(self, issue_id: str, state_name: str) -> None:
+        return None
+
+    async def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
 
 class DummyRunner:
     async def run(self, *args: Any, **kwargs: Any) -> object:
