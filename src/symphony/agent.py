@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import shlex
 import sys
 import tempfile
@@ -168,9 +170,7 @@ class CodexSession:
         turn_response = await self._request("turn/start", turn_params)
         turn = turn_response.get("turn") if isinstance(turn_response, dict) else None
         turn_id = turn.get("id") if isinstance(turn, dict) else None
-        session_id = (
-            f"{self._thread_id}-{turn_id}" if isinstance(turn_id, str) else self._thread_id
-        )
+        session_id = f"{self._thread_id}-{turn_id}" if isinstance(turn_id, str) else self._thread_id
         await on_event(
             "session_started",
             {
@@ -394,9 +394,7 @@ class CodexSession:
             return
         await self._emit("turn_input_required", payload)
         if self._turn_done is not None and not self._turn_done.done():
-            self._turn_done.set_exception(
-                AgentError("turn_input_required", _summary(payload))
-            )
+            self._turn_done.set_exception(AgentError("turn_input_required", _summary(payload)))
 
     async def _emit(self, event: str, payload: JsonObject) -> None:
         if self._current_turn_events is None:
@@ -412,9 +410,15 @@ class CodexSession:
             self._turn_done.set_exception(error)
 
 
+TMUX_SESSION_PREFIX = "symphony-"
+
+
 class ClaudeTmuxClient:
     def __init__(self, config: ServiceConfig) -> None:
         self._config = config
+
+    async def startup_cleanup(self) -> None:
+        await kill_orphan_tmux_sessions()
 
     async def start_session(
         self, *, workspace: Path, issue: Issue, on_event: AgentEventCallback
@@ -427,6 +431,7 @@ class _ClaudeTmuxSession:
         self._config = config
         self._workspace = workspace
         self._issue = issue
+        self._active_sessions: set[str] = set()
 
     async def run_turn(
         self, *, prompt: str, turn_number: int, on_event: AgentEventCallback
@@ -435,16 +440,32 @@ class _ClaudeTmuxSession:
         run_dir = Path(tempfile.mkdtemp(prefix="symphony-claude-", dir=self._workspace))
         log_path = run_dir / "claude.log"
         done_path = run_dir / "done"
+        prompt_path = run_dir / "prompt.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
         mcp_config_path = self._write_mcp_config(run_dir)
         session_name = _tmux_session_name(self._issue.identifier, turn_number)
-        command = self._tmux_command(prompt, log_path, done_path, mcp_config_path)
+        buffer_name = f"symphony-{session_name}"
+        command = self._tmux_command(done_path, mcp_config_path)
         env = self._claude_env()
+        log_path.touch()
+        LOG.info(
+            "tmux_session creating issue=%s turn=%d session=%s log=%s run_dir=%s",
+            self._issue.identifier,
+            turn_number,
+            session_name,
+            log_path,
+            run_dir,
+        )
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             "new-session",
             "-d",
             "-s",
             session_name,
+            "-x",
+            "200",
+            "-y",
+            "50",
             "bash",
             "-lc",
             command,
@@ -455,14 +476,32 @@ class _ClaudeTmuxSession:
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             message = stderr.decode(errors="replace").strip()
+            LOG.error(
+                "tmux_session start_failed issue=%s session=%s stderr=%s",
+                self._issue.identifier,
+                session_name,
+                message,
+            )
             raise AgentError("port_exit", f"failed to start Claude tmux session: {message}")
+        self._active_sessions.add(session_name)
+        await _tmux_run("set-option", "-t", session_name, "remain-on-exit", "off", check=False)
+        pipe_cmd = f"cat >> {shlex.quote(str(log_path))}"
+        await _tmux_run("pipe-pane", "-o", "-t", session_name, pipe_cmd)
+        attach_command = f"tmux attach-session -t {shlex.quote(session_name)}"
+        LOG.info(
+            "tmux_session started issue=%s turn=%d session=%s attach=%r",
+            self._issue.identifier,
+            turn_number,
+            session_name,
+            attach_command,
+        )
         await on_event(
             "session_started",
             {
                 "event": "session_started",
                 "timestamp": utc_now().isoformat(),
                 "tmux_session": session_name,
-                "tmux_attach_command": f"tmux attach-session -t {shlex.quote(session_name)}",
+                "tmux_attach_command": attach_command,
                 "claude_log_path": str(log_path),
                 "thread_id": f"{self._issue.id}",
                 "turn_id": str(turn_number),
@@ -471,15 +510,49 @@ class _ClaudeTmuxSession:
         )
         try:
             await asyncio.wait_for(
-                self._stream_until_done(log_path, done_path, session_name, on_event),
+                self._drive_turn(
+                    prompt_path=prompt_path,
+                    buffer_name=buffer_name,
+                    session_name=session_name,
+                    log_path=log_path,
+                    done_path=done_path,
+                    on_event=on_event,
+                ),
                 self._config.claude.turn_timeout_ms / 1000,
             )
         except TimeoutError as exc:
-            await _tmux_kill_session(session_name)
+            LOG.warning(
+                "tmux_session timed_out issue=%s session=%s timeout_ms=%d",
+                self._issue.identifier,
+                session_name,
+                self._config.claude.turn_timeout_ms,
+            )
             raise AgentError("turn_timeout", "Claude turn timed out") from exc
+        finally:
+            await self._cleanup_session(session_name)
 
     async def stop(self) -> None:
-        return None
+        for session_name in list(self._active_sessions):
+            await self._cleanup_session(session_name)
+
+    async def _cleanup_session(self, session_name: str) -> None:
+        if session_name not in self._active_sessions:
+            return
+        self._active_sessions.discard(session_name)
+        alive = await _tmux_has_session(session_name)
+        if alive:
+            await _tmux_kill_session(session_name)
+            LOG.info(
+                "tmux_session killed issue=%s session=%s",
+                self._issue.identifier,
+                session_name,
+            )
+        else:
+            LOG.info(
+                "tmux_session ended issue=%s session=%s",
+                self._issue.identifier,
+                session_name,
+            )
 
     def _claude_env(self) -> dict[str, str] | None:
         import os
@@ -489,27 +562,185 @@ class _ClaudeTmuxSession:
             env["LINEAR_API_KEY"] = self._config.tracker.api_key
         return env
 
-    def _tmux_command(
-        self, prompt: str, log_path: Path, done_path: Path, mcp_config_path: Path | None
-    ) -> str:
+    def _tmux_command(self, done_path: Path, mcp_config_path: Path | None) -> str:
         claude_command = self._config.claude.command
         if mcp_config_path is not None:
-            claude_command = (
-                f"{claude_command} --mcp-config {shlex.quote(str(mcp_config_path))}"
-            )
-        quoted_prompt = shlex.quote(prompt)
-        quoted_log = shlex.quote(str(log_path))
+            claude_command = f"{claude_command} --mcp-config {shlex.quote(str(mcp_config_path))}"
         quoted_done = shlex.quote(str(done_path))
         return (
-            f"touch {quoted_log}; "
-            f"printf '%s\\n' {quoted_prompt} "
-            f"| {claude_command} "
-            f"> >(tee -a {quoted_log}) "
-            f"2> >(tee -a {quoted_log} >&2); "
-            "rc=${PIPESTATUS[1]}; "
+            f"{claude_command}; "
+            "rc=$?; "
             f"printf '%s' \"$rc\" > {quoted_done}; "
             'printf "\\n[symphony] Claude exited rc=%s\\n" "$rc"; '
             'exit "$rc"'
+        )
+
+    async def _drive_turn(
+        self,
+        *,
+        prompt_path: Path,
+        buffer_name: str,
+        session_name: str,
+        log_path: Path,
+        done_path: Path,
+        on_event: AgentEventCallback,
+    ) -> None:
+        await self._wait_repl_ready(session_name, done_path)
+        if done_path.exists():
+            await self._finalize_done(log_path, done_path, session_name, on_event)
+            return
+        await _tmux_run("load-buffer", "-b", buffer_name, str(prompt_path))
+        try:
+            await _tmux_run("paste-buffer", "-p", "-b", buffer_name, "-t", session_name)
+        finally:
+            await _tmux_run("delete-buffer", "-b", buffer_name, check=False)
+        await asyncio.sleep(0.3)
+        await _tmux_run("send-keys", "-t", session_name, "Enter")
+        await self._stream_until_idle(
+            log_path=log_path,
+            done_path=done_path,
+            session_name=session_name,
+            on_event=on_event,
+        )
+
+    async def _wait_repl_ready(self, session_name: str, done_path: Path) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60.0
+        last_snapshot: str | None = None
+        stable_since: float | None = None
+        dismissed_trust = False
+        while loop.time() < deadline:
+            await asyncio.sleep(0.4)
+            if done_path.exists():
+                return
+            snapshot_text = _strip_ansi(await _tmux_capture(session_name))
+            lowered = snapshot_text.lower()
+            if not dismissed_trust and "trust this folder" in lowered:
+                await _tmux_run("send-keys", "-t", session_name, "Enter")
+                dismissed_trust = True
+                last_snapshot = None
+                stable_since = None
+                await asyncio.sleep(1.0)
+                continue
+            if last_snapshot is not None and snapshot_text == last_snapshot:
+                if stable_since is None:
+                    stable_since = loop.time()
+                elif loop.time() - stable_since >= 1.2:
+                    return
+            else:
+                stable_since = None
+                last_snapshot = snapshot_text
+        raise AgentError("port_exit", "Claude REPL never became ready inside tmux")
+
+    async def _stream_until_idle(
+        self,
+        *,
+        log_path: Path,
+        done_path: Path,
+        session_name: str,
+        on_event: AgentEventCallback,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        idle_threshold = self._config.claude.stall_timeout_ms / 1000
+        poll_interval = self._config.claude.read_timeout_ms / 1000
+        offset = 0
+        last_log_size = 0
+        last_activity = loop.time()
+        sent_exit = False
+        exit_sent_at: float | None = None
+        while True:
+            await asyncio.sleep(poll_interval)
+            if log_path.exists():
+                size = log_path.stat().st_size
+                if size > offset:
+                    data = log_path.read_bytes()[offset:size]
+                    offset = size
+                    await self._emit_log_chunk(data, on_event)
+                    last_activity = loop.time()
+                    last_log_size = size
+                else:
+                    if loop.time() - last_activity >= 10.0:
+                        await on_event(
+                            "heartbeat",
+                            {
+                                "event": "heartbeat",
+                                "timestamp": utc_now().isoformat(),
+                                "log_size": size,
+                                "idle_seconds": round(loop.time() - last_activity, 1),
+                            },
+                        )
+            if done_path.exists():
+                await self._finalize_done(log_path, done_path, session_name, on_event)
+                return
+            idle_for = loop.time() - last_activity
+            if not sent_exit and idle_for >= idle_threshold and last_log_size > 0:
+                await _tmux_run("send-keys", "-t", session_name, "/exit", "Enter")
+                sent_exit = True
+                exit_sent_at = loop.time()
+                await on_event(
+                    "turn_idle",
+                    {
+                        "event": "turn_idle",
+                        "timestamp": utc_now().isoformat(),
+                        "idle_seconds": round(idle_for, 1),
+                    },
+                )
+            if sent_exit and exit_sent_at is not None and loop.time() - exit_sent_at >= 20.0:
+                if done_path.exists():
+                    await self._finalize_done(log_path, done_path, session_name, on_event)
+                    return
+                LOG.info(
+                    "tmux_session idle_exit_forced issue=%s session=%s",
+                    self._issue.identifier,
+                    session_name,
+                )
+                await on_event(
+                    "turn_completed",
+                    {"event": "turn_completed", "timestamp": utc_now().isoformat()},
+                )
+                return
+
+    async def _finalize_done(
+        self,
+        log_path: Path,
+        done_path: Path,
+        session_name: str,
+        on_event: AgentEventCallback,
+    ) -> None:
+        await asyncio.sleep(0.2)
+        rc_text = done_path.read_text(errors="replace").strip()
+        rc = int(rc_text) if rc_text.isdigit() else 1
+        if rc == 0:
+            await on_event(
+                "turn_completed",
+                {"event": "turn_completed", "timestamp": utc_now().isoformat()},
+            )
+            return
+        message = f"Claude harness exited rc={rc}"
+        tail = log_path.read_text(errors="replace")[-1000:] if log_path.exists() else ""
+        if tail:
+            message = f"{message}: {_strip_ansi(tail).strip()}"
+        LOG.warning(
+            "tmux_session claude_failed issue=%s session=%s rc=%d",
+            self._issue.identifier,
+            session_name,
+            rc,
+        )
+        raise AgentError("port_exit", message)
+
+    async def _emit_log_chunk(self, data: bytes, on_event: AgentEventCallback) -> None:
+        if len(data) > _MAX_PROTOCOL_LINE_BYTES:
+            data = data[-_MAX_PROTOCOL_LINE_BYTES:]
+        text = _strip_ansi(data.decode(errors="replace")).strip()
+        if not text:
+            return
+        await on_event(
+            "message",
+            {
+                "event": "message",
+                "timestamp": utc_now().isoformat(),
+                "text": text[-4000:],
+            },
         )
 
     def _write_mcp_config(self, run_dir: Path) -> Path | None:
@@ -530,69 +761,6 @@ class _ClaudeTmuxSession:
         config_path.write_text(json.dumps(config), encoding="utf-8")
         return config_path
 
-    async def _stream_until_done(
-        self,
-        log_path: Path,
-        done_path: Path,
-        session_name: str,
-        on_event: AgentEventCallback,
-    ) -> None:
-        offset = 0
-        pending = b""
-        while True:
-            await asyncio.sleep(self._config.claude.read_timeout_ms / 1000)
-            if log_path.exists():
-                data = log_path.read_bytes()
-                chunk = data[offset:]
-                offset = len(data)
-                if chunk:
-                    pending += chunk
-                    lines = pending.splitlines(keepends=True)
-                    if lines and not lines[-1].endswith((b"\n", b"\r")):
-                        pending = lines.pop()
-                    else:
-                        pending = b""
-                    for line in lines:
-                        await self._emit_claude_line(line, on_event)
-                elif not done_path.exists():
-                    await on_event(
-                        "heartbeat",
-                        {"event": "heartbeat", "timestamp": utc_now().isoformat()},
-                    )
-            if done_path.exists():
-                if log_path.exists():
-                    data = log_path.read_bytes()
-                    chunk = data[offset:]
-                    offset = len(data)
-                    if chunk:
-                        pending += chunk
-                if pending:
-                    await self._emit_claude_line(pending, on_event)
-                    pending = b""
-                rc_text = done_path.read_text(errors="replace").strip()
-                rc = int(rc_text) if rc_text.isdigit() else 1
-                if rc == 0:
-                    await on_event(
-                        "turn_completed",
-                        {"event": "turn_completed", "timestamp": utc_now().isoformat()},
-                    )
-                    return
-                message = f"Claude harness exited rc={rc}"
-                tail = log_path.read_text(errors="replace")[-1000:] if log_path.exists() else ""
-                if tail:
-                    message = f"{message}: {tail.strip()}"
-                await _tmux_kill_session(session_name)
-                raise AgentError("port_exit", message)
-
-    async def _emit_claude_line(self, line: bytes, on_event: AgentEventCallback) -> None:
-        if len(line) > _MAX_PROTOCOL_LINE_BYTES:
-            raise AgentError("response_error", "Claude protocol line exceeded limit")
-        text = line.decode(errors="replace").rstrip()
-        if not text:
-            return
-        payload = _parse_claude_line(text)
-        await on_event(str(payload.get("event") or "message"), payload)
-
 
 ClaudePrintClient = ClaudeTmuxClient
 
@@ -609,6 +777,15 @@ class AgentRunner:
         self._workspace_manager = workspace_manager
         self._tracker = tracker
         self._client = client or _build_client(config, tracker)
+
+    async def startup_cleanup(self) -> None:
+        cleanup = getattr(self._client, "startup_cleanup", None)
+        if cleanup is None:
+            return
+        try:
+            await cleanup()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not abort startup
+            LOG.warning("startup_cleanup failed: %s", exc)
 
     async def run(
         self,
@@ -661,9 +838,7 @@ def _build_client(config: ServiceConfig, tracker: IssueTracker) -> AgentClient:
     return CodexAppServerClient(config, tools)
 
 
-def _resolve_turn_sandbox_policy(
-    configured: str | None, workspace: Path
-) -> JsonObject | None:
+def _resolve_turn_sandbox_policy(configured: str | None, workspace: Path) -> JsonObject | None:
     if configured is None:
         return {
             "type": "workspaceWrite",
@@ -719,11 +894,28 @@ def _summary(payload: JsonObject) -> str:
     return ""
 
 
+_PID_PREFIX_RE = re.compile(r"^symphony-pid(\d+)-")
+
+
 def _tmux_session_name(issue_identifier: str, turn_number: int) -> str:
     safe_issue = "".join(
         char if char.isalnum() or char in {"_", "-"} else "-" for char in issue_identifier
     )
-    return f"symphony-{safe_issue}-{turn_number}-{uuid.uuid4().hex[:8]}"
+    return f"symphony-pid{os.getpid()}-{safe_issue}-{turn_number}-{uuid.uuid4().hex[:8]}"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 async def _tmux_kill_session(session_name: str) -> None:
@@ -738,6 +930,89 @@ async def _tmux_kill_session(session_name: str) -> None:
     await proc.wait()
 
 
+async def _tmux_has_session(session_name: str) -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        "tmux",
+        "has-session",
+        "-t",
+        session_name,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    rc = await proc.wait()
+    return rc == 0
+
+
+async def kill_orphan_tmux_sessions(prefix: str = TMUX_SESSION_PREFIX) -> list[str]:
+    """Kill `symphony-pid<PID>-*` tmux sessions whose owning PID is gone.
+
+    Sessions without the `pid<N>` marker (older format or unrelated) are left
+    alone, as are sessions whose PID is still alive — that includes another
+    live orchestrator instance.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "tmux",
+        "list-sessions",
+        "-F",
+        "#{session_name}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return []
+    killed: list[str] = []
+    for raw in stdout.decode(errors="replace").splitlines():
+        name = raw.strip()
+        if not name or not name.startswith(prefix):
+            continue
+        match = _PID_PREFIX_RE.match(name)
+        if match is None:
+            continue
+        owner_pid = int(match.group(1))
+        if _pid_alive(owner_pid):
+            continue
+        await _tmux_kill_session(name)
+        LOG.info(
+            "tmux_session orphan_killed session=%s owner_pid=%d",
+            name,
+            owner_pid,
+        )
+        killed.append(name)
+    return killed
+
+
+async def _tmux_run(*args: str, check: bool = True) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "tmux",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    rc = proc.returncode or 0
+    if check and rc != 0:
+        raise AgentError(
+            "port_exit",
+            f"tmux {args[0]} failed rc={rc}: {stderr.decode(errors='replace').strip()}",
+        )
+    return rc, stdout.decode(errors="replace")
+
+
+async def _tmux_capture(session_name: str) -> str:
+    rc, output = await _tmux_run("capture-pane", "-p", "-t", session_name, check=False)
+    if rc != 0:
+        return ""
+    return output
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub("", text).replace("\r", "")
+
+
 async def _drain_stderr(stderr: asyncio.StreamReader) -> None:
     try:
         while True:
@@ -749,16 +1024,3 @@ async def _drain_stderr(stderr: asyncio.StreamReader) -> None:
                 LOG.debug("codex stderr: %s", text)
     except asyncio.CancelledError:
         return
-
-
-def _parse_claude_line(text: str) -> JsonObject:
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return {"event": "message", "timestamp": utc_now().isoformat(), "text": text}
-    if not isinstance(payload, dict):
-        return {"event": "message", "timestamp": utc_now().isoformat(), "text": text}
-    result: JsonObject = {str(k): _coerce_value(v) for k, v in payload.items()}
-    result.setdefault("event", str(payload.get("type") or "message"))
-    result.setdefault("timestamp", utc_now().isoformat())
-    return result

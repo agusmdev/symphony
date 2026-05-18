@@ -54,6 +54,7 @@ class Orchestrator:
     async def start(self) -> None:
         self.config.validate_for_dispatch()
         await self.startup_terminal_workspace_cleanup()
+        await self._runner_startup_cleanup()
         while not self._stop.is_set():
             await self.tick()
             with suppress(TimeoutError):
@@ -113,6 +114,15 @@ class Orchestrator:
             )
             return None
         return current
+
+    async def _runner_startup_cleanup(self) -> None:
+        cleanup = getattr(self.runner, "startup_cleanup", None)
+        if cleanup is None:
+            return
+        try:
+            await cleanup()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not abort startup
+            LOG.warning("runner_startup_cleanup failed: %s", exc)
 
     async def startup_terminal_workspace_cleanup(self) -> None:
         try:
