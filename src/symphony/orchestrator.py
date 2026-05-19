@@ -12,7 +12,15 @@ from typing import Protocol, cast
 
 from symphony.config import ServiceConfig
 from symphony.errors import SymphonyError
-from symphony.models import Issue, JsonObject, OrchestratorState, RetryEntry, RunningEntry, utc_now
+from symphony.models import (
+    Issue,
+    JsonObject,
+    OrchestratorState,
+    RetryEntry,
+    RunningEntry,
+    WorkflowDefinition,
+    utc_now,
+)
 from symphony.tracker import IssueTracker
 from symphony.workspace import WorkspaceManager
 
@@ -25,7 +33,7 @@ class Runner(Protocol):
         self,
         issue: Issue,
         attempt: int | None,
-        prompt_template: str,
+        workflow: Callable[[], WorkflowDefinition],
         on_event: Callable[[str, JsonObject], Awaitable[None]],
     ) -> object: ...
 
@@ -37,13 +45,13 @@ class Orchestrator:
         tracker: IssueTracker,
         workspace_manager: WorkspaceManager,
         runner: Runner,
-        prompt_template: str,
+        workflow: WorkflowDefinition,
     ) -> None:
         self.config = config
         self.tracker = tracker
         self.workspace_manager = workspace_manager
         self.runner: Runner = runner
-        self.prompt_template = prompt_template
+        self.workflow = workflow
         self.state = OrchestratorState(
             poll_interval_ms=config.polling.interval_ms,
             max_concurrent_agents=config.agent.max_concurrent_agents,
@@ -52,7 +60,7 @@ class Orchestrator:
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
-        self.config.validate_for_dispatch()
+        self.config.validate_for_dispatch(self.workflow)
         await self.startup_terminal_workspace_cleanup()
         await self._runner_startup_cleanup()
         while not self._stop.is_set():
@@ -71,7 +79,7 @@ class Orchestrator:
         async with self._lock:
             await self.reconcile_running_issues()
             try:
-                self.config.validate_for_dispatch()
+                self.config.validate_for_dispatch(self.workflow)
             except SymphonyError as exc:
                 LOG.error("validation failed code=%s message=%s", exc.code, exc.message)
                 return
@@ -120,6 +128,9 @@ class Orchestrator:
         if cleanup is None:
             return
         try:
+            await cleanup(self.workflow)
+        except TypeError:
+            # Older runners may not accept the workflow arg.
             await cleanup()
         except Exception as exc:  # noqa: BLE001 - cleanup must not abort startup
             LOG.warning("runner_startup_cleanup failed: %s", exc)
@@ -140,10 +151,9 @@ class Orchestrator:
         for issue_id, entry in list(self.state.running.items()):
             last = entry.live_session.last_codex_timestamp or entry.started_at
             elapsed_ms = (now - last).total_seconds() * 1000
-            if (
-                self.config.harness_stall_timeout_ms > 0
-                and elapsed_ms > self.config.harness_stall_timeout_ms
-            ):
+            harness = self._harness_for_running(entry.issue.state)
+            stall_ms = self.config.stall_timeout_ms_for(harness)
+            if stall_ms > 0 and elapsed_ms > stall_ms:
                 await self._terminate(issue_id, cleanup_workspace=False, reason="stalled")
         ids = list(self.state.running)
         if not ids:
@@ -174,6 +184,12 @@ class Orchestrator:
             if issue_id not in self.state.running:
                 continue
             await self._terminate(issue_id, cleanup_workspace=False, reason="vanished")
+
+    def _harness_for_running(self, state: str) -> str:
+        handler = self.workflow.state_handlers.get(state.lower())
+        if handler is not None and handler.harness is not None:
+            return handler.harness
+        return self.config.agent.harness
 
     def available_slots(self) -> int:
         return max(self.state.max_concurrent_agents - len(self.state.running), 0)
@@ -230,7 +246,7 @@ class Orchestrator:
             path = await self.runner.run(
                 issue,
                 attempt,
-                self.prompt_template,
+                lambda: self.workflow,
                 lambda event, payload: self.on_agent_event(issue.id, event, payload),
             )
             entry = self.state.running.get(issue.id)

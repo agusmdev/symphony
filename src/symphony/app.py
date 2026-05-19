@@ -29,7 +29,7 @@ class SymphonyApp:
         tracker = LinearTracker(config)
         workspace = WorkspaceManager(config.workspace, config.hooks)
         runner = AgentRunner(config, workspace, tracker)
-        return Orchestrator(config, tracker, workspace, runner, definition.prompt_template)
+        return Orchestrator(config, tracker, workspace, runner, definition)
 
     async def run(self) -> None:
         watcher = asyncio.create_task(self._watch_workflow())
@@ -52,14 +52,14 @@ class SymphonyApp:
             try:
                 definition = load_workflow(self.workflow_path)
                 config = build_config(definition, base_dir=self.workflow_path.parent)
-                config.validate_for_dispatch()
+                config.validate_for_dispatch(definition)
             except Exception as exc:
                 LOG.error("workflow_reload failed reason=%s", exc)
                 continue
             self.definition = definition
             self.config = config
             self.orchestrator.config = config
-            self.orchestrator.prompt_template = definition.prompt_template
+            self.orchestrator.workflow = definition
             self.orchestrator.state.poll_interval_ms = config.polling.interval_ms
             self.orchestrator.state.max_concurrent_agents = config.agent.max_concurrent_agents
             LOG.info("workflow_reload completed path=%s", self.workflow_path)

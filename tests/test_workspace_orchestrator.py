@@ -101,18 +101,17 @@ class DummyRunner:
 
 
 def make_orchestrator(tmp_path: Path) -> Orchestrator:
-    config = build_config(
-        WorkflowDefinition(
-            {
-                "tracker": {"kind": "linear", "api_key": "x", "project_slug": "proj"},
-                "workspace": {"root": str(tmp_path)},
-            },
-            "",
-        )
+    definition = WorkflowDefinition(
+        {
+            "tracker": {"kind": "linear", "api_key": "x", "project_slug": "proj"},
+            "workspace": {"root": str(tmp_path)},
+        },
+        "",
     )
+    config = build_config(definition)
     tracker = EmptyTracker()
     workspace = WorkspaceManager(config.workspace, config.hooks)
-    return Orchestrator(config, tracker, workspace, DummyRunner(), "")
+    return Orchestrator(config, tracker, workspace, DummyRunner(), definition)
 
 
 def test_todo_blocked_by_non_terminal_is_ineligible(tmp_path: Path) -> None:

@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 from symphony.config import ServiceConfig
 from symphony.errors import AgentError
-from symphony.models import Issue, JsonObject, utc_now
+from symphony.models import Issue, JsonObject, StateHandler, WorkflowDefinition, utc_now
 from symphony.prompt import continuation_prompt, render_prompt
 from symphony.tools import Tool, tool_specs
 from symphony.tracker import IssueTracker, LinearTracker
@@ -776,35 +776,77 @@ class AgentRunner:
         self._config = config
         self._workspace_manager = workspace_manager
         self._tracker = tracker
-        self._client = client or _build_client(config, tracker)
+        self._clients: dict[str, AgentClient] = {}
+        if client is not None:
+            self._clients[config.agent.harness] = client
 
-    async def startup_cleanup(self) -> None:
-        cleanup = getattr(self._client, "startup_cleanup", None)
-        if cleanup is None:
-            return
-        try:
-            await cleanup()
-        except Exception as exc:  # noqa: BLE001 - cleanup must not abort startup
-            LOG.warning("startup_cleanup failed: %s", exc)
+    def _client_for(self, harness: str) -> AgentClient:
+        existing = self._clients.get(harness)
+        if existing is not None:
+            return existing
+        built = _build_client_for_harness(harness, self._config, self._tracker)
+        self._clients[harness] = built
+        return built
+
+    async def startup_cleanup(self, workflow: WorkflowDefinition | None = None) -> None:
+        harnesses = {self._config.agent.harness}
+        if workflow is not None:
+            for handler in workflow.state_handlers.values():
+                if handler.harness is not None:
+                    harnesses.add(handler.harness)
+        # Eagerly build every referenced harness so its cleanup runs at startup,
+        # not only the default — otherwise orphan tmux/app-server processes from a
+        # prior run leak when a harness is used only by a state-level handler.
+        for harness in harnesses:
+            self._client_for(harness)
+        for client in self._clients.values():
+            cleanup = getattr(client, "startup_cleanup", None)
+            if cleanup is None:
+                continue
+            try:
+                await cleanup()
+            except Exception as exc:  # noqa: BLE001 - cleanup must not abort startup
+                LOG.warning("startup_cleanup failed: %s", exc)
+
+    def _handler_for(
+        self, workflow: WorkflowDefinition, state: str
+    ) -> StateHandler:
+        handler = workflow.state_handlers.get(state.lower())
+        if handler is None:
+            return StateHandler(
+                harness=self._config.agent.harness,
+                prompt_template=workflow.prompt_template,
+            )
+        if handler.harness is None:
+            return StateHandler(
+                harness=self._config.agent.harness,
+                prompt_template=handler.prompt_template,
+            )
+        return handler
 
     async def run(
         self,
         issue: Issue,
         attempt: int | None,
-        prompt_template: str,
+        workflow: WorkflowGetter,
         on_event: AgentEventCallback,
     ) -> Path:
         workspace = await self._workspace_manager.create_for_issue(issue.identifier)
         await self._workspace_manager.before_run(workspace.path)
         try:
-            session = await self._client.start_session(
+            get_workflow = _coerce_workflow_getter(workflow)
+            handler = self._handler_for(get_workflow(), issue.state)
+            client = self._client_for(handler.harness or self._config.agent.harness)
+            session = await client.start_session(
                 workspace=workspace.path, issue=issue, on_event=on_event
             )
             try:
                 current_issue = issue
+                initial_state = issue.state.lower()
+                initial_harness = handler.harness
                 for turn_number in range(1, self._config.agent.max_turns + 1):
                     prompt = (
-                        render_prompt(prompt_template, current_issue, attempt)
+                        render_prompt(handler.prompt_template, current_issue, attempt)
                         if turn_number == 1
                         else continuation_prompt(
                             current_issue, turn_number, self._config.agent.max_turns
@@ -820,6 +862,14 @@ class AgentRunner:
                         break
                     if not current_issue.assigned_to_worker:
                         break
+                    if current_issue.state.lower() != initial_state:
+                        # State changed mid-run; let re-dispatch pick the right handler.
+                        break
+                    # Re-resolve from the live workflow in case it was hot-reloaded.
+                    # Continuation turns can't swap clients safely; bail to re-dispatch.
+                    latest = self._handler_for(get_workflow(), current_issue.state)
+                    if latest.harness != initial_harness:
+                        break
             finally:
                 await session.stop()
             return workspace.path
@@ -827,15 +877,31 @@ class AgentRunner:
             await self._workspace_manager.after_run(workspace.path)
 
 
-def _build_client(config: ServiceConfig, tracker: IssueTracker) -> AgentClient:
-    if config.agent.harness == "claude":
-        return ClaudeTmuxClient(config)
-    tools: list[Tool] = []
-    if isinstance(tracker, LinearTracker):
-        from symphony.tools import LinearGraphqlTool
+WorkflowGetter = WorkflowDefinition | Callable[[], WorkflowDefinition]
 
-        tools.append(LinearGraphqlTool(tracker))
-    return CodexAppServerClient(config, tools)
+
+def _coerce_workflow_getter(
+    workflow: WorkflowGetter,
+) -> Callable[[], WorkflowDefinition]:
+    if isinstance(workflow, WorkflowDefinition):
+        snapshot = workflow
+        return lambda: snapshot
+    return workflow
+
+
+def _build_client_for_harness(
+    harness: str, config: ServiceConfig, tracker: IssueTracker
+) -> AgentClient:
+    if harness == "claude":
+        return ClaudeTmuxClient(config)
+    if harness == "codex":
+        tools: list[Tool] = []
+        if isinstance(tracker, LinearTracker):
+            from symphony.tools import LinearGraphqlTool
+
+            tools.append(LinearGraphqlTool(tracker))
+        return CodexAppServerClient(config, tools)
+    raise AgentError("unsupported_agent_harness", f"unsupported harness: {harness}")
 
 
 def _resolve_turn_sandbox_policy(configured: str | None, workspace: Path) -> JsonObject | None:

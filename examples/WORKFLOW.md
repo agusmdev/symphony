@@ -26,14 +26,29 @@ hooks:
   after_create: |
     git clone --depth 1 git@github.com:your-org/your-repo.git .
 agent:
-  harness: codex          # or `claude`
+  harness: codex          # default harness, used when a state doesn't specify one
   max_concurrent_agents: 3
   max_turns: 20
 codex:
   command: codex app-server
 claude:
   command: claude
+# Optional per-state composition. Each state names a prompt section below
+# (## prompt:<name>) and optionally overrides the harness. States not listed
+# fall back to `agent.harness` and the unnamed body at the top of this file.
+states:
+  Todo:           { harness: codex,  prompt: implement }
+  "In Progress":  { harness: codex,  prompt: implement }
+  "Human Review": { harness: claude, prompt: review }
+  Rework:         { harness: codex,  prompt: rework }
+  Merging:        { harness: codex,  prompt: merge }
 ---
+
+Default workflow body. This text applies to any active state without an entry
+in the `states:` map above. Keeping it lets single-template `WORKFLOW.md` files
+go on working unchanged; remove it once every active state has a section.
+
+## prompt:implement
 
 You are working on Linear issue {{ issue.identifier }}: {{ issue.title }}.
 
@@ -51,7 +66,7 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
-## Prerequisite: Linear access
+### Prerequisite: Linear access
 
 You can talk to Linear via the `linear_graphql` tool:
 
@@ -71,117 +86,54 @@ Tool input shape:
 
 Treat a top-level `errors` array on the response as a failed operation even if the tool call itself returned successfully.
 
-## Default posture
+### Default posture
 
-- Start by determining the ticket's current status, then follow the matching flow for that status.
 - Open the persistent workpad comment first and bring it up to date before doing new implementation work.
 - Spend extra effort on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
 - Treat one persistent Linear comment as the source of truth for progress; do not post separate "done"/summary comments.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input.
 - File a separate Linear `Backlog` issue when meaningful out-of-scope work is discovered; do not expand current scope.
-- Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked.
 
-## Status map
-
-- `Backlog` -> out of scope; do not modify.
-- `Todo` -> queued; immediately transition to `In Progress` before active work. If a PR is already attached, run the PR feedback sweep first.
-- `In Progress` -> implementation actively underway.
-- `Human Review` -> PR is attached and validated; waiting on human approval.
-- `Merging` -> approved by human; run the merge flow (do not call `gh pr merge` directly when a `land` skill is provided).
-- `Rework` -> reviewer requested changes; full approach reset required.
-- `Done` -> terminal; no further action.
-
-## Step 0: Determine current ticket state and route
+### Step 0: Kickoff
 
 1. Fetch the issue by explicit identifier using `linear_graphql`.
-2. Read the current state.
-3. Route to the matching flow.
-4. For `Todo`: do startup sequencing in this exact order:
-   - `issueUpdate` to `In Progress`
-   - Find or create the `## Codex Workpad` bootstrap comment
-   - Only then begin analysis/planning/implementation work.
-5. If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable: create a fresh branch from `origin/main` and restart as a new attempt.
+2. If state is `Todo`, transition to `In Progress` via `issueUpdate` before any code work.
+3. Find or create the single `## Codex Workpad` bootstrap comment for the issue.
+4. If a branch PR is already attached and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable: create a fresh branch from `origin/main` and restart as a new attempt.
 
-## Step 1: Start/continue execution (Todo or In Progress)
+### Step 1: Plan
 
-1. Find or create a single persistent workpad comment for the issue (header: `## Codex Workpad`).
-2. Reconcile the workpad before new edits: check off items already done, expand/fix the plan, refresh acceptance criteria and validation.
-3. Write/update a hierarchical plan in the workpad, with explicit acceptance criteria and TODOs in checklist form.
-4. Include a compact environment stamp at the top: `<host>:<abs-workdir>@<short-sha>`.
-5. If the ticket includes `Validation`/`Test Plan`/`Testing`, copy them into the workpad's required checkboxes.
-6. Capture a concrete reproduction signal before implementing and record it in workpad `Notes`.
-7. Sync with `origin/main` and record the result in workpad `Notes`.
+1. Reconcile the workpad before new edits: check off items already done, expand/fix the plan, refresh acceptance criteria and validation.
+2. Write/update a hierarchical plan in the workpad, with explicit acceptance criteria and TODOs in checklist form.
+3. Include a compact environment stamp at the top: `<host>:<abs-workdir>@<short-sha>`.
+4. If the ticket includes `Validation`/`Test Plan`/`Testing`, copy them into the workpad's required checkboxes.
+5. Capture a concrete reproduction signal before implementing and record it in workpad `Notes`.
+6. Sync with `origin/main` and record the result in workpad `Notes`.
 
-## Step 2: Execution phase (Todo -> In Progress -> Human Review)
+### Step 2: Execute
 
-1. Verify the kickoff sync result is recorded before implementation continues.
-2. If state is `Todo`, move to `In Progress`.
-3. Treat the workpad comment as the active execution checklist; update it after each meaningful milestone.
-4. Implement against the hierarchical TODOs.
-5. Run all required validation/tests. Mandatory gate: execute every ticket-provided `Validation`/`Test Plan`/`Testing` item.
-6. Re-check acceptance criteria and close any gaps.
-7. Before every `git push`, confirm the required validation passes; commit and push.
-8. Attach the PR URL to the issue.
-9. Merge latest `origin/main` into the branch, resolve conflicts, rerun checks.
-10. Update the workpad with final checklist status and validation notes.
-11. Before moving to `Human Review`:
-    - Run the PR feedback sweep.
-    - Confirm PR checks are green.
-    - Confirm every required validation item is checked.
-    - Re-open the workpad and reconcile so `Plan`/`Acceptance Criteria`/`Validation` match completed work.
-12. Move issue to `Human Review`.
+1. Treat the workpad comment as the active execution checklist; update it after each meaningful milestone.
+2. Implement against the hierarchical TODOs.
+3. Run all required validation/tests. Mandatory gate: execute every ticket-provided `Validation`/`Test Plan`/`Testing` item.
+4. Re-check acceptance criteria and close any gaps.
+5. Before every `git push`, confirm the required validation passes; commit and push.
+6. Attach the PR URL to the issue.
+7. Merge latest `origin/main` into the branch, resolve conflicts, rerun checks.
+8. Update the workpad with final checklist status and validation notes.
 
-## PR feedback sweep protocol
+### Step 3: Hand off to review
 
-When a ticket has an attached PR, run this before moving to `Human Review`:
+When the completion bar below is satisfied, transition the issue state to `Human Review`. From that point a separate review handler takes over (see `## prompt:review`).
 
-1. Identify the PR number from issue links/attachments.
-2. Gather feedback from all channels (top-level comments, inline review comments, review summaries).
-3. Treat every actionable reviewer comment (human or bot) as blocking until resolved with code/test/docs updates OR an explicit, justified pushback reply.
-4. Update the workpad plan/checklist with each feedback item and its resolution.
-5. Re-run validation after feedback-driven changes and push updates.
-6. Repeat until no outstanding actionable comments remain.
-
-## Step 3: Human Review and merge
-
-1. While in `Human Review`, do not code or change ticket content; poll for updates.
-2. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
-3. When approved, the human moves the issue to `Merging`.
-4. While in `Merging`, run the merge flow until the PR is merged.
-5. After merge, move the issue to `Done`.
-
-## Step 4: Rework handling
-
-1. Treat `Rework` as a full approach reset, not incremental patching.
-2. Re-read the full issue body and all human comments; identify what will be done differently.
-3. Close the existing PR tied to the issue.
-4. Remove the existing `## Codex Workpad` comment from the issue.
-5. Create a fresh branch from `origin/main`.
-6. Start over from the normal kickoff flow.
-
-## Completion bar before Human Review
+Completion bar:
 
 - Workpad reflects the completed plan, acceptance criteria, and validation results.
 - Required validation/tests are green for the latest commit.
-- PR feedback sweep complete, no actionable comments remaining.
 - PR checks are green, branch is pushed, PR is linked on the issue.
 
-## Guardrails
-
-- If the branch PR is already closed/merged, do not reuse it; restart on a fresh branch from `origin/main`.
-- If issue state is `Backlog`, do not modify it.
-- Do not edit the issue body/description for planning or progress tracking.
-- Use exactly one persistent workpad comment (`## Codex Workpad`) per issue.
-- Temporary proof edits are allowed only for local verification and must be reverted before commit.
-- Do not move to `Human Review` unless the completion bar is satisfied.
-- In `Human Review`, do not make changes; wait and poll.
-- If state is terminal (`Done`), do nothing and shut down.
-
-## Workpad template
-
-Use this exact structure for the persistent workpad comment:
+### Workpad template
 
 ````md
 ## Codex Workpad
@@ -211,3 +163,46 @@ Use this exact structure for the persistent workpad comment:
 
 - Anything unclear during execution (omit when empty)
 ````
+
+## prompt:review
+
+You are reviewing the in-flight PR for Linear issue {{ issue.identifier }}: {{ issue.title }}.
+
+The implementing agent has handed control over by moving the ticket to `Human Review`. Your job here is to do a rigorous second-opinion pass — not to keep coding.
+
+1. Use `linear_graphql` to fetch the issue and the persistent `## Codex Workpad` comment so you have full context.
+2. Identify the PR attached to the issue. Read the diff, the description, and every existing review/inline comment.
+3. Verify the completion bar from `## prompt:implement` is actually met against the diff:
+   - Acceptance criteria items match observable behavior.
+   - `Validation`/`Test Plan`/`Testing` steps have evidence (CI runs, manual notes in workpad).
+   - Tests cover the changed surface and would fail without the fix.
+4. Look for the usual review red flags: silent failure paths, missing input validation, race conditions, dropped error handling, dead code, scope creep beyond the ticket.
+5. Post one consolidated review comment on the PR summarizing findings. Use sections: `Looks Good`, `Must Fix Before Merge`, `Nice To Have`.
+6. Append a short `### Review pass <UTC timestamp>` block to the existing `## Codex Workpad` comment with the same summary.
+7. Decide the next state:
+   - If anything sits under `Must Fix Before Merge`, transition the issue to `Rework`.
+   - Otherwise leave the issue in `Human Review` for the human approver and stop. Do not move it to `Merging` yourself.
+
+Do not edit code in this state. If you find a bug worth fixing, it must go through `Rework`.
+
+## prompt:rework
+
+The reviewer has moved {{ issue.identifier }} back to `Rework`. Treat this as a full approach reset, not incremental patching.
+
+1. Re-read the full issue body, every human comment, and the latest review comment on the PR.
+2. Use `linear_graphql` to remove the existing `## Codex Workpad` comment from the issue so the next implementation pass starts from a clean slate.
+3. Close the existing PR tied to the issue.
+4. Create a fresh branch from `origin/main`.
+5. Transition the issue back to `In Progress` and restart from the kickoff flow described in `## prompt:implement`.
+
+## prompt:merge
+
+The human approver has moved {{ issue.identifier }} to `Merging`. Drive the PR to a merged state.
+
+1. Confirm the PR is approved and all required checks are green.
+2. If a `land` skill is available in this environment, use it instead of calling `gh pr merge` directly.
+3. Otherwise merge the PR via `gh pr merge --squash --auto` (or the repo's documented merge style) and wait for the merge to land.
+4. After merge, transition the issue to `Done` via `linear_graphql`.
+5. Update the `## Codex Workpad` comment with a final `### Merged <UTC timestamp>` line referencing the merge commit SHA.
+
+Stop once the issue is `Done` and the workpad reflects the merge.

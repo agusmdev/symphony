@@ -99,7 +99,7 @@ class ServiceConfig:
     def terminal_states_normalized(self) -> set[str]:
         return {state.lower() for state in self.tracker.terminal_states}
 
-    def validate_for_dispatch(self) -> None:
+    def validate_for_dispatch(self, workflow: WorkflowDefinition) -> None:
         if self.tracker.kind != "linear":
             raise ConfigError("unsupported_tracker_kind", "tracker.kind must be linear")
         if not self.tracker.api_key:
@@ -108,17 +108,26 @@ class ServiceConfig:
             raise ConfigError("missing_tracker_project_slug", "tracker.project_slug is required")
         if self.agent.harness not in {"codex", "claude"}:
             raise ConfigError("unsupported_agent_harness", "agent.harness must be codex or claude")
-        if self.agent.harness == "codex" and not self.codex.command.strip():
-            raise ConfigError("missing_codex_command", "codex.command is required")
-        if self.agent.harness == "claude" and not self.claude.command.strip():
-            raise ConfigError("missing_claude_command", "claude.command is required")
+        for harness in self.referenced_harnesses(workflow):
+            self._require_harness_command(harness)
 
-    @property
-    def harness_stall_timeout_ms(self) -> int:
-        if self.agent.harness == "claude":
+    def referenced_harnesses(self, workflow: WorkflowDefinition) -> set[str]:
+        harnesses = {self.agent.harness}
+        for handler in workflow.state_handlers.values():
+            if handler.harness is not None:
+                harnesses.add(handler.harness)
+        return harnesses
+
+    def stall_timeout_ms_for(self, harness: str) -> int:
+        if harness == "claude":
             return self.claude.stall_timeout_ms
         return self.codex.stall_timeout_ms
 
+    def _require_harness_command(self, harness: str) -> None:
+        if harness == "codex" and not self.codex.command.strip():
+            raise ConfigError("missing_codex_command", "codex.command is required")
+        if harness == "claude" and not self.claude.command.strip():
+            raise ConfigError("missing_claude_command", "claude.command is required")
 
 def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None) -> ServiceConfig:
     root = definition.config
@@ -144,6 +153,7 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
         base_dir=base_dir,
     )
 
+    terminal_states_tuple = _str_tuple(tracker.get("terminal_states"), TERMINAL_STATES)
     return ServiceConfig(
         tracker=TrackerConfig(
             kind=kind,
@@ -151,8 +161,12 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
             api_key=api_key,
             project_slug=_optional_str(tracker.get("project_slug")),
             assignee=assignee,
-            active_states=_str_tuple(tracker.get("active_states"), ACTIVE_STATES),
-            terminal_states=_str_tuple(tracker.get("terminal_states"), TERMINAL_STATES),
+            active_states=_merge_state_keys(
+                _str_tuple(tracker.get("active_states"), ACTIVE_STATES),
+                root.get("states"),
+                terminal_states_tuple,
+            ),
+            terminal_states=terminal_states_tuple,
         ),
         polling=PollingConfig(interval_ms=_positive_int(polling.get("interval_ms"), 30_000)),
         workspace=WorkspaceConfig(root=workspace_root),
@@ -221,6 +235,33 @@ def _str_tuple(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
         return default
     result = tuple(item for item in value if isinstance(item, str) and item)
     return result or default
+
+
+def _merge_state_keys(
+    active: tuple[str, ...],
+    states_raw: Any,
+    terminal: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not isinstance(states_raw, Mapping):
+        return active
+    terminal_set = {state.lower() for state in terminal}
+    seen = {state.lower() for state in active}
+    extras: list[str] = []
+    for key in states_raw:
+        if not isinstance(key, str) or not key:
+            continue
+        lowered = key.lower()
+        if lowered in terminal_set:
+            raise ConfigError(
+                "state_overlaps_terminal",
+                f"states.{key} also appears in terminal_states; "
+                "refusing to dispatch a terminal state",
+            )
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        extras.append(key)
+    return active + tuple(extras)
 
 
 def _state_limits(value: Any) -> Mapping[str, int]:

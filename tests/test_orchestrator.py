@@ -21,18 +21,17 @@ from symphony.workspace import WorkspaceManager
 
 
 def _orchestrator(tmp_path: Path, tracker: Any) -> Orchestrator:
-    config = build_config(
-        WorkflowDefinition(
-            {
-                "tracker": {"kind": "linear", "api_key": "x", "project_slug": "proj"},
-                "workspace": {"root": str(tmp_path)},
-            },
-            "",
-        )
+    definition = WorkflowDefinition(
+        {
+            "tracker": {"kind": "linear", "api_key": "x", "project_slug": "proj"},
+            "workspace": {"root": str(tmp_path)},
+        },
+        "",
     )
+    config = build_config(definition)
     workspace = WorkspaceManager(config.workspace, config.hooks)
     runner = _NoopRunner()
-    return Orchestrator(config, tracker, workspace, runner, "")
+    return Orchestrator(config, tracker, workspace, runner, definition)
 
 
 class _NoopRunner:

@@ -40,9 +40,16 @@ class Issue:
 
 
 @dataclass(frozen=True, slots=True)
+class StateHandler:
+    harness: str | None
+    prompt_template: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkflowDefinition:
     config: dict[str, Any]
     prompt_template: str
+    state_handlers: dict[str, StateHandler] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

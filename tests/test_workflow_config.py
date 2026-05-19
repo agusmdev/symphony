@@ -40,7 +40,7 @@ def test_defaults_and_env_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert config.tracker.api_key == "secret"
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
     assert config.agent.max_concurrent_agents_by_state == {"todo": 2}
-    config.validate_for_dispatch()
+    config.validate_for_dispatch(definition)
 
 
 def test_claude_harness_config() -> None:
@@ -55,8 +55,8 @@ def test_claude_harness_config() -> None:
     config = build_config(definition)
     assert config.agent.harness == "claude"
     assert config.claude.command == "claude"
-    assert config.harness_stall_timeout_ms == 123
-    config.validate_for_dispatch()
+    assert config.stall_timeout_ms_for("claude") == 123
+    config.validate_for_dispatch(definition)
 
 
 def test_unknown_harness_rejected() -> None:
@@ -69,7 +69,7 @@ def test_unknown_harness_rejected() -> None:
     )
     config = build_config(definition)
     with pytest.raises(SymphonyError, match="unsupported_agent_harness"):
-        config.validate_for_dispatch()
+        config.validate_for_dispatch(definition)
 
 
 def test_prompt_strict_unknown_variable() -> None:
@@ -153,3 +153,183 @@ def test_default_active_states_include_human_review_and_merging() -> None:
     assert "human review" in states
     assert "merging" in states
     assert "rework" in states
+
+
+def test_state_handlers_parsed_from_named_sections(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n"
+        "  Todo: {harness: codex, prompt: implement}\n"
+        "  \"In Review\": {harness: claude, prompt: review}\n"
+        "---\n"
+        "default body\n"
+        "\n"
+        "## prompt:implement\n"
+        "Implement {{ issue.identifier }}.\n"
+        "\n"
+        "## prompt:review\n"
+        "Review {{ issue.identifier }}.\n"
+    )
+    loaded = load_workflow(path)
+    assert loaded.prompt_template == "default body"
+    assert set(loaded.state_handlers.keys()) == {"todo", "in review"}
+    assert loaded.state_handlers["todo"].harness == "codex"
+    assert loaded.state_handlers["todo"].prompt_template == "Implement {{ issue.identifier }}."
+    assert loaded.state_handlers["in review"].harness == "claude"
+    assert loaded.state_handlers["in review"].prompt_template == "Review {{ issue.identifier }}."
+
+
+def test_states_keys_union_into_active_states(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "  active_states: [Todo]\n"
+        "states:\n"
+        "  \"In Review\": {prompt: review}\n"
+        "---\n"
+        "## prompt:review\nbody\n"
+    )
+    loaded = load_workflow(path)
+    config = build_config(loaded)
+    assert "Todo" in config.tracker.active_states
+    assert "In Review" in config.tracker.active_states
+
+
+def test_unknown_prompt_section_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n  Todo: {prompt: missing}\n"
+        "---\n"
+        "## prompt:other\nbody\n"
+    )
+    with pytest.raises(SymphonyError, match="unknown_prompt_section"):
+        load_workflow(path)
+
+
+def test_invalid_state_handler_harness_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n  Todo: {harness: bogus, prompt: x}\n"
+        "---\n"
+        "## prompt:x\nbody\n"
+    )
+    with pytest.raises(SymphonyError, match="invalid_state_handler_harness"):
+        load_workflow(path)
+
+
+def test_back_compat_no_states_keeps_body_as_default(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "---\n"
+        "Hello {{ issue.identifier }}\n"
+    )
+    loaded = load_workflow(path)
+    assert loaded.state_handlers == {}
+    assert loaded.prompt_template == "Hello {{ issue.identifier }}"
+
+
+def test_validate_for_dispatch_checks_per_state_harness_commands(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "agent:\n  harness: codex\n"
+        "claude:\n  command: ''\n"
+        "states:\n  \"In Review\": {harness: claude, prompt: r}\n"
+        "---\n"
+        "## prompt:r\nbody\n"
+    )
+    loaded = load_workflow(path)
+    config = build_config(loaded)
+    with pytest.raises(SymphonyError, match="missing_claude_command"):
+        config.validate_for_dispatch(loaded)
+
+
+def test_prompt_header_inside_fence_is_ignored(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n  Todo: {prompt: real}\n"
+        "---\n"
+        "## prompt:real\n"
+        "Render this.\n"
+        "\n"
+        "```md\n"
+        "## prompt:fake\n"
+        "this should be part of real, not its own section\n"
+        "```\n"
+        "After fence.\n"
+    )
+    loaded = load_workflow(path)
+    assert set(loaded.state_handlers.keys()) == {"todo"}
+    template = loaded.state_handlers["todo"].prompt_template
+    assert "## prompt:fake" in template
+    assert "After fence." in template
+
+
+def test_duplicate_prompt_section_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "---\n"
+        "## prompt:foo\nfirst\n"
+        "## prompt:FOO\nsecond\n"
+    )
+    with pytest.raises(SymphonyError, match="duplicate_prompt_section"):
+        load_workflow(path)
+
+
+def test_duplicate_state_key_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n"
+        "  Todo: {prompt: x}\n"
+        "  todo: {prompt: x}\n"
+        "---\n"
+        "## prompt:x\nbody\n"
+    )
+    with pytest.raises(SymphonyError, match="duplicate_state_key"):
+        load_workflow(path)
+
+
+def test_states_terminal_overlap_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "  terminal_states: [Done]\n"
+        "states:\n  Done: {prompt: x}\n"
+        "---\n"
+        "## prompt:x\nbody\n"
+    )
+    loaded = load_workflow(path)
+    with pytest.raises(SymphonyError, match="state_overlaps_terminal"):
+        build_config(loaded)
+
+
+def test_stall_timeout_per_harness() -> None:
+    definition = WorkflowDefinition(
+        config={
+            "tracker": {"kind": "linear", "api_key": "k", "project_slug": "p"},
+            "agent": {"harness": "codex"},
+            "codex": {"stall_timeout_ms": 111},
+            "claude": {"stall_timeout_ms": 222},
+        },
+        prompt_template="body",
+    )
+    config = build_config(definition)
+    assert config.stall_timeout_ms_for("codex") == 111
+    assert config.stall_timeout_ms_for("claude") == 222
