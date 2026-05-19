@@ -129,9 +129,6 @@ class Orchestrator:
             return
         try:
             await cleanup(self.workflow)
-        except TypeError:
-            # Older runners may not accept the workflow arg.
-            await cleanup()
         except Exception as exc:  # noqa: BLE001 - cleanup must not abort startup
             LOG.warning("runner_startup_cleanup failed: %s", exc)
 
@@ -151,8 +148,10 @@ class Orchestrator:
         for issue_id, entry in list(self.state.running.items()):
             last = entry.live_session.last_codex_timestamp or entry.started_at
             elapsed_ms = (now - last).total_seconds() * 1000
-            harness = self._harness_for_running(entry.issue.state)
-            stall_ms = self.config.stall_timeout_ms_for(harness)
+            # Use the harness recorded at dispatch — a hot reload that swaps the
+            # handler must NOT retroactively change the stall budget of a session
+            # still running under the old client.
+            stall_ms = self.config.stall_timeout_ms_for(entry.harness)
             if stall_ms > 0 and elapsed_ms > stall_ms:
                 await self._terminate(issue_id, cleanup_workspace=False, reason="stalled")
         ids = list(self.state.running)
@@ -185,7 +184,7 @@ class Orchestrator:
                 continue
             await self._terminate(issue_id, cleanup_workspace=False, reason="vanished")
 
-    def _harness_for_running(self, state: str) -> str:
+    def _resolve_harness(self, state: str) -> str:
         handler = self.workflow.state_handlers.get(state.lower())
         if handler is not None and handler.harness is not None:
             return handler.harness
@@ -233,6 +232,7 @@ class Orchestrator:
             workspace_path=None,
             retry_attempt=attempt,
             started_at=utc_now(),
+            harness=self._resolve_harness(issue.state),
         )
         self.state.claimed.add(issue.id)
         retry = self.state.retry_attempts.pop(issue.id, None)

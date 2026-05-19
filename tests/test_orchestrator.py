@@ -248,6 +248,26 @@ async def test_reconcile_keeps_running_when_refresh_fails(tmp_path: Path) -> Non
     assert running.id in orchestrator.state.running
 
 
+@pytest.mark.asyncio
+async def test_dispatch_records_harness_on_running_entry(tmp_path: Path) -> None:
+    from symphony.models import StateHandler
+
+    orchestrator = _orchestrator(tmp_path, _RecordingTracker())
+    # Inject a state handler that overrides the default harness.
+    orchestrator.workflow = WorkflowDefinition(
+        config=orchestrator.workflow.config,
+        prompt_template=orchestrator.workflow.prompt_template,
+        state_handlers={
+            "human review": StateHandler(harness="claude", prompt_template="review"),
+        },
+    )
+    orchestrator.dispatch_issue(_issue(state="Human Review"), None)
+    entry = orchestrator.state.running["i1"]
+    assert entry.harness == "claude", "dispatch must snapshot the resolved harness"
+    # Cancel the worker we just spawned so the test doesn't leave a pending task.
+    entry.worker.cancel()
+
+
 def _make_running_entry(issue: Issue) -> RunningEntry:
     task: asyncio.Task[Any] = asyncio.Task(_never_completes(), loop=_ensure_loop())
     task.cancel()

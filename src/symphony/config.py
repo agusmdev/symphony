@@ -153,7 +153,27 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
         base_dir=base_dir,
     )
 
-    terminal_states_tuple = _str_tuple(tracker.get("terminal_states"), TERMINAL_STATES)
+    raw_terminal = tracker.get("terminal_states")
+    terminal_explicit = isinstance(raw_terminal, list) and any(
+        isinstance(item, str) and item for item in raw_terminal
+    )
+    terminal_states_tuple = _str_tuple(raw_terminal, TERMINAL_STATES)
+    state_keys_lower = _state_keys_lower(root.get("states"))
+    if state_keys_lower:
+        # Explicit terminal: any overlap is a contradiction the user wrote on purpose.
+        # Default terminal: `states:` wins and we drop the overlapping defaults.
+        terminal_lower = {state.lower() for state in terminal_states_tuple}
+        overlap = state_keys_lower & terminal_lower
+        if overlap:
+            if terminal_explicit:
+                raise ConfigError(
+                    "state_overlaps_terminal",
+                    f"states.{sorted(overlap)} also appear in terminal_states; "
+                    "remove from one or the other",
+                )
+            terminal_states_tuple = tuple(
+                state for state in terminal_states_tuple if state.lower() not in overlap
+            )
     return ServiceConfig(
         tracker=TrackerConfig(
             kind=kind,
@@ -164,7 +184,6 @@ def build_config(definition: WorkflowDefinition, *, base_dir: Path | None = None
             active_states=_merge_state_keys(
                 _str_tuple(tracker.get("active_states"), ACTIVE_STATES),
                 root.get("states"),
-                terminal_states_tuple,
             ),
             terminal_states=terminal_states_tuple,
         ),
@@ -237,31 +256,26 @@ def _str_tuple(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
     return result or default
 
 
-def _merge_state_keys(
-    active: tuple[str, ...],
-    states_raw: Any,
-    terminal: tuple[str, ...],
-) -> tuple[str, ...]:
+def _merge_state_keys(active: tuple[str, ...], states_raw: Any) -> tuple[str, ...]:
     if not isinstance(states_raw, Mapping):
         return active
-    terminal_set = {state.lower() for state in terminal}
     seen = {state.lower() for state in active}
     extras: list[str] = []
     for key in states_raw:
         if not isinstance(key, str) or not key:
             continue
         lowered = key.lower()
-        if lowered in terminal_set:
-            raise ConfigError(
-                "state_overlaps_terminal",
-                f"states.{key} also appears in terminal_states; "
-                "refusing to dispatch a terminal state",
-            )
         if lowered in seen:
             continue
         seen.add(lowered)
         extras.append(key)
     return active + tuple(extras)
+
+
+def _state_keys_lower(states_raw: Any) -> set[str]:
+    if not isinstance(states_raw, Mapping):
+        return set()
+    return {key.lower() for key in states_raw if isinstance(key, str) and key}
 
 
 def _state_limits(value: Any) -> Mapping[str, int]:

@@ -11,7 +11,33 @@ from symphony.models import StateHandler, WorkflowDefinition
 
 SUPPORTED_HARNESSES = ("codex", "claude")
 _PROMPT_HEADER_RE = re.compile(r"^##\s+prompt:(\S+)\s*$")
-_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+_FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})")
+
+
+class _DuplicateKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate mapping keys instead of silently keeping the last."""
+
+
+def _construct_mapping(
+    loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                f"duplicate mapping key: {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_DuplicateKeyLoader.add_constructor(  # type: ignore[no-untyped-call]
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping
+)
 
 
 def select_workflow_path(explicit_path: str | None) -> Path:
@@ -40,7 +66,7 @@ def load_workflow(path: Path) -> WorkflowDefinition:
         yaml_text = "".join(lines[1:end_index])
         body = "".join(lines[end_index + 1 :])
         try:
-            loaded = yaml.safe_load(yaml_text) if yaml_text.strip() else {}
+            loaded = yaml.load(yaml_text, Loader=_DuplicateKeyLoader) if yaml_text.strip() else {}
         except yaml.YAMLError as exc:
             raise WorkflowError("invalid_workflow_front_matter", str(exc)) from exc
         if loaded is None:
@@ -67,17 +93,19 @@ def _split_prompt_sections(body: str) -> tuple[str, dict[str, str]]:
     default_lines: list[str] = []
     current_name: str | None = None
     current_lines: list[str] = []
-    fence_marker: str | None = None
+    fence: str | None = None  # exact opening fence string (e.g., "````" or "~~~~~")
     raw_names_seen: dict[str, str] = {}
     for line in body.splitlines():
         fence_match = _FENCE_RE.match(line)
         if fence_match:
-            marker = fence_match.group(1)[0] * 3
-            if fence_marker is None:
-                fence_marker = marker
-            elif marker == fence_marker and line.lstrip().startswith(fence_marker):
-                fence_marker = None
-        header_match = None if fence_marker is not None else _PROMPT_HEADER_RE.match(line)
+            marker = fence_match.group(2)
+            if fence is None:
+                fence = marker
+            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                # CommonMark: closing fence uses the same char and is at least as long.
+                fence = None
+            # Fence-toggling lines themselves go into the current bucket below.
+        header_match = None if fence is not None else _PROMPT_HEADER_RE.match(line)
         if header_match:
             if current_name is not None:
                 sections[current_name] = "\n".join(current_lines).strip()
@@ -95,6 +123,11 @@ def _split_prompt_sections(body: str) -> tuple[str, dict[str, str]]:
             default_lines.append(line)
         else:
             current_lines.append(line)
+    if fence is not None:
+        raise WorkflowError(
+            "unterminated_fence",
+            f"workflow body ends with an unterminated code fence (opened with {fence!r})",
+        )
     if current_name is not None:
         sections[current_name] = "\n".join(current_lines).strip()
     return "\n".join(default_lines).strip(), sections

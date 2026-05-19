@@ -277,6 +277,65 @@ def test_prompt_header_inside_fence_is_ignored(tmp_path: Path) -> None:
     assert "After fence." in template
 
 
+def test_four_backtick_fence_tolerates_inner_three_backticks(tmp_path: Path) -> None:
+    # A 4-backtick fence must not be prematurely closed by an inner 3-backtick line.
+    # Same for the `## prompt:` header inside it.
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n  Todo: {prompt: real}\n"
+        "---\n"
+        "## prompt:real\n"
+        "Outer body.\n"
+        "\n"
+        "````md\n"
+        "```\n"
+        "## prompt:fake-inside-3-fence\n"
+        "```\n"
+        "## prompt:also-fake\n"
+        "````\n"
+        "After outer fence.\n"
+    )
+    loaded = load_workflow(path)
+    assert set(loaded.state_handlers.keys()) == {"todo"}
+    template = loaded.state_handlers["todo"].prompt_template
+    assert "## prompt:fake-inside-3-fence" in template
+    assert "## prompt:also-fake" in template
+    assert "After outer fence." in template
+
+
+def test_unterminated_fence_raises(tmp_path: Path) -> None:
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "---\n"
+        "## prompt:foo\n"
+        "```python\n"
+        "open fence, never closed\n"
+    )
+    with pytest.raises(SymphonyError, match="unterminated_fence"):
+        load_workflow(path)
+
+
+def test_yaml_duplicate_top_level_key_rejected(tmp_path: Path) -> None:
+    # PyYAML's safe_load silently keeps the last value on duplicate keys.
+    # Our custom loader must reject this so the user's intent isn't dropped.
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n  Todo: {prompt: x}\n"
+        "states:\n  Todo: {prompt: y}\n"
+        "---\n"
+        "## prompt:x\nx\n"
+        "## prompt:y\ny\n"
+    )
+    with pytest.raises(SymphonyError, match="invalid_workflow_front_matter"):
+        load_workflow(path)
+
+
 def test_duplicate_prompt_section_rejected(tmp_path: Path) -> None:
     path = tmp_path / "WORKFLOW.md"
     path.write_text(
@@ -318,6 +377,24 @@ def test_states_terminal_overlap_rejected(tmp_path: Path) -> None:
     loaded = load_workflow(path)
     with pytest.raises(SymphonyError, match="state_overlaps_terminal"):
         build_config(loaded)
+
+
+def test_default_terminal_yields_to_states_map(tmp_path: Path) -> None:
+    # When `terminal_states:` is not explicitly set, the default `Done` should
+    # yield to a `states:` entry rather than raising — the user can't have
+    # contradicted themselves about a value they never wrote.
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n  Done: {prompt: x}\n"
+        "---\n"
+        "## prompt:x\nbody\n"
+    )
+    loaded = load_workflow(path)
+    config = build_config(loaded)
+    assert "Done" in config.tracker.active_states
+    assert "Done" not in config.tracker.terminal_states
 
 
 def test_stall_timeout_per_harness() -> None:

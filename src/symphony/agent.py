@@ -765,6 +765,22 @@ class _ClaudeTmuxSession:
 ClaudePrintClient = ClaudeTmuxClient
 
 
+WorkflowGetter = WorkflowDefinition | Callable[[], WorkflowDefinition]
+
+
+def _coerce_workflow_getter(
+    workflow: WorkflowGetter,
+) -> Callable[[], WorkflowDefinition]:
+    if isinstance(workflow, WorkflowDefinition):
+        snapshot = workflow
+        return lambda: snapshot
+    if callable(workflow):
+        return workflow
+    raise TypeError(
+        f"workflow must be WorkflowDefinition or callable; got {type(workflow).__name__}"
+    )
+
+
 class AgentRunner:
     def __init__(
         self,
@@ -843,7 +859,7 @@ class AgentRunner:
             try:
                 current_issue = issue
                 initial_state = issue.state.lower()
-                initial_harness = handler.harness
+                initial_handler = handler
                 for turn_number in range(1, self._config.agent.max_turns + 1):
                     prompt = (
                         render_prompt(handler.prompt_template, current_issue, attempt)
@@ -865,28 +881,17 @@ class AgentRunner:
                     if current_issue.state.lower() != initial_state:
                         # State changed mid-run; let re-dispatch pick the right handler.
                         break
-                    # Re-resolve from the live workflow in case it was hot-reloaded.
-                    # Continuation turns can't swap clients safely; bail to re-dispatch.
+                    # Re-resolve from the live workflow so hot reload takes effect: any
+                    # change to harness OR prompt template breaks the loop and forces a
+                    # fresh dispatch that re-renders turn 1 against the new handler.
                     latest = self._handler_for(get_workflow(), current_issue.state)
-                    if latest.harness != initial_harness:
+                    if latest != initial_handler:
                         break
             finally:
                 await session.stop()
             return workspace.path
         finally:
             await self._workspace_manager.after_run(workspace.path)
-
-
-WorkflowGetter = WorkflowDefinition | Callable[[], WorkflowDefinition]
-
-
-def _coerce_workflow_getter(
-    workflow: WorkflowGetter,
-) -> Callable[[], WorkflowDefinition]:
-    if isinstance(workflow, WorkflowDefinition):
-        snapshot = workflow
-        return lambda: snapshot
-    return workflow
 
 
 def _build_client_for_harness(

@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from symphony.agent import AgentRunner
+from symphony.agent import AgentRunner, _coerce_workflow_getter
 from symphony.config import ServiceConfig, build_config
 from symphony.models import Issue, JsonObject, StateHandler, WorkflowDefinition, Workspace
 
@@ -216,6 +216,65 @@ async def test_missing_state_handler_falls_back_to_default(tmp_path: Path) -> No
     session = client.sessions[-1]
     assert session.prompts
     assert "fallback ABC-1" in session.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_prompt_only_change_breaks_loop(tmp_path: Path) -> None:
+    # Per-turn handler comparison must compare the full StateHandler so a
+    # prompt-only edit (no harness change) also forces re-dispatch.
+    config = _config(tmp_path)
+    initial = WorkflowDefinition(
+        config={"tracker": {"kind": "linear"}},
+        prompt_template="default",
+        state_handlers={
+            "todo": StateHandler(harness="codex", prompt_template="v1"),
+        },
+    )
+    reloaded = WorkflowDefinition(
+        config={"tracker": {"kind": "linear"}},
+        prompt_template="default",
+        state_handlers={
+            "todo": StateHandler(harness="codex", prompt_template="v2"),
+        },
+    )
+    tracker = _FakeTracker(sequence=[_issue("Todo"), _issue("Todo")])
+    runner = AgentRunner(
+        config,
+        workspace_manager=_FakeWorkspaceManager(tmp_path),
+        tracker=tracker,  # type: ignore[arg-type]
+    )
+    live: dict[str, WorkflowDefinition] = {"workflow": initial}
+
+    class _SwappingSession(_FakeSession):
+        async def run_turn(self, *, prompt: str, turn_number: int, on_event: Any) -> None:
+            await super().run_turn(prompt=prompt, turn_number=turn_number, on_event=on_event)
+            if turn_number == 1:
+                live["workflow"] = reloaded
+
+    swap_client = _FakeClient()
+
+    async def _start(**kwargs: Any) -> _SwappingSession:
+        session = _SwappingSession()
+        swap_client.sessions.append(session)
+        return session
+
+    swap_client.start_session = _start  # type: ignore[method-assign]
+    runner._clients[config.agent.harness] = swap_client
+
+    async def _noop(event: str, payload: JsonObject) -> None:
+        return None
+
+    await runner.run(_issue("Todo"), None, lambda: live["workflow"], _noop)
+
+    session = swap_client.sessions[-1]
+    assert len(session.prompts) == 1, "prompt change should break before turn 2"
+
+
+def test_coerce_workflow_getter_rejects_invalid_inputs() -> None:
+    with pytest.raises(TypeError, match="workflow must be WorkflowDefinition or callable"):
+        _coerce_workflow_getter(None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="workflow must be WorkflowDefinition or callable"):
+        _coerce_workflow_getter({"not": "a workflow"})  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
