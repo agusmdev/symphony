@@ -56,10 +56,7 @@ class SymphonyApp:
             except Exception as exc:
                 LOG.error("workflow_reload failed reason=%s", exc)
                 continue
+            await self.orchestrator.replace(config, definition)
             self.definition = definition
             self.config = config
-            self.orchestrator.config = config
-            self.orchestrator.workflow = definition
-            self.orchestrator.state.poll_interval_ms = config.polling.interval_ms
-            self.orchestrator.state.max_concurrent_agents = config.agent.max_concurrent_agents
             LOG.info("workflow_reload completed path=%s", self.workflow_path)

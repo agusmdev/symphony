@@ -98,7 +98,7 @@ class RunningEntry:
     workspace_path: Path | None
     retry_attempt: int | None
     started_at: datetime
-    harness: str = "codex"
+    harness: str
     live_session: LiveSession = field(default_factory=LiveSession)
     cancel_requested: bool = False
 

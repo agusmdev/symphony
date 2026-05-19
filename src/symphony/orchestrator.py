@@ -75,6 +75,24 @@ class Orchestrator:
             if isinstance(worker, asyncio.Task):
                 worker.cancel()
 
+    async def replace(
+        self, config: ServiceConfig, workflow: WorkflowDefinition
+    ) -> None:
+        """Atomically adopt hot-reloaded config + workflow under the tick lock.
+
+        Without the lock, a concurrent reconcile could see a fresh workflow
+        but the stale config (or vice versa). Also propagates the new config
+        into the runner so its harness/timeout snapshots stay in sync.
+        """
+        async with self._lock:
+            self.config = config
+            self.workflow = workflow
+            self.state.poll_interval_ms = config.polling.interval_ms
+            self.state.max_concurrent_agents = config.agent.max_concurrent_agents
+            set_runner_config = getattr(self.runner, "set_config", None)
+            if set_runner_config is not None:
+                set_runner_config(config)
+
     async def tick(self) -> None:
         async with self._lock:
             await self.reconcile_running_issues()

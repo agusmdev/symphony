@@ -319,6 +319,47 @@ def test_unterminated_fence_raises(tmp_path: Path) -> None:
         load_workflow(path)
 
 
+def test_indented_backticks_not_treated_as_fence(tmp_path: Path) -> None:
+    # CommonMark allows up to 3 spaces of indent for a fence; 4+ spaces is an
+    # indented code block. A workflow body containing a 4-space-indented
+    # backtick-triplet line must not be treated as opening a fence (would
+    # otherwise raise unterminated_fence at EOF).
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "tracker:\n  kind: linear\n  api_key: k\n  project_slug: p\n"
+        "states:\n  Todo: {prompt: foo}\n"
+        "---\n"
+        "## prompt:foo\n"
+        "Body text:\n"
+        "\n"
+        "    ```\n"
+        "    indented code that happens to contain backticks\n"
+        "    ```\n"
+        "\n"
+        "more body\n"
+    )
+    loaded = load_workflow(path)
+    assert "indented code" in loaded.state_handlers["todo"].prompt_template
+    assert "more body" in loaded.state_handlers["todo"].prompt_template
+
+
+def test_unhashable_yaml_key_raises_workflow_error(tmp_path: Path) -> None:
+    # `? [a, b]\n: value` deserializes the key as a list (unhashable).
+    # Without the guard this escaped as a bare TypeError; now it must surface
+    # as a WorkflowError tagged `invalid_workflow_front_matter`.
+    path = tmp_path / "WORKFLOW.md"
+    path.write_text(
+        "---\n"
+        "? [a, b]\n"
+        ": value\n"
+        "---\n"
+        "body\n"
+    )
+    with pytest.raises(SymphonyError, match="invalid_workflow_front_matter"):
+        load_workflow(path)
+
+
 def test_yaml_duplicate_top_level_key_rejected(tmp_path: Path) -> None:
     # PyYAML's safe_load silently keeps the last value on duplicate keys.
     # Our custom loader must reject this so the user's intent isn't dropped.

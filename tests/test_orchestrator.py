@@ -264,11 +264,64 @@ async def test_dispatch_records_harness_on_running_entry(tmp_path: Path) -> None
     orchestrator.dispatch_issue(_issue(state="Human Review"), None)
     entry = orchestrator.state.running["i1"]
     assert entry.harness == "claude", "dispatch must snapshot the resolved harness"
-    # Cancel the worker we just spawned so the test doesn't leave a pending task.
+    # Cancel the worker and await it so pytest-asyncio doesn't warn about a
+    # destroyed-pending task and so on_worker_exit cleanup actually runs.
     entry.worker.cancel()
+    await asyncio.gather(entry.worker, return_exceptions=True)
 
 
-def _make_running_entry(issue: Issue) -> RunningEntry:
+@pytest.mark.asyncio
+async def test_runner_startup_cleanup_does_not_retry_on_typeerror(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Regression for the old `except TypeError: await cleanup()` fallback that
+    # ran cleanup twice and masked real startup bugs as "old runner signature".
+    orchestrator = _orchestrator(tmp_path, _RecordingTracker())
+    invocations = 0
+
+    class _Boom:
+        async def startup_cleanup(self, workflow: Any) -> None:
+            nonlocal invocations
+            invocations += 1
+            raise TypeError("simulated downstream bug, not a signature mismatch")
+
+        async def run(self, *_a: Any, **_kw: Any) -> object:  # pragma: no cover
+            return None
+
+    orchestrator.runner = _Boom()  # type: ignore[assignment]
+    with caplog.at_level("WARNING", logger="symphony"):
+        await orchestrator._runner_startup_cleanup()
+    assert invocations == 1, "TypeError must not trigger a silent retry"
+    assert any("runner_startup_cleanup failed" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_replace_propagates_config_to_runner(tmp_path: Path) -> None:
+    from symphony.config import build_config
+
+    orchestrator = _orchestrator(tmp_path, _RecordingTracker())
+    captured: list[Any] = []
+
+    class _ConfigSpy:
+        def set_config(self, config: Any) -> None:
+            captured.append(config)
+
+        async def run(self, *_a: Any, **_kw: Any) -> object:
+            return None
+
+    orchestrator.runner = _ConfigSpy()  # type: ignore[assignment]
+    new_definition = WorkflowDefinition(
+        {"tracker": {"kind": "linear", "api_key": "x", "project_slug": "proj2"}},
+        "",
+    )
+    new_config = build_config(new_definition)
+    await orchestrator.replace(new_config, new_definition)
+    assert captured == [new_config], "replace must propagate fresh config to runner"
+    assert orchestrator.workflow is new_definition
+    assert orchestrator.config is new_config
+
+
+def _make_running_entry(issue: Issue, *, harness: str = "codex") -> RunningEntry:
     task: asyncio.Task[Any] = asyncio.Task(_never_completes(), loop=_ensure_loop())
     task.cancel()
     return RunningEntry(
@@ -277,6 +330,7 @@ def _make_running_entry(issue: Issue) -> RunningEntry:
         workspace_path=None,
         retry_attempt=None,
         started_at=utc_now(),
+        harness=harness,
     )
 
 

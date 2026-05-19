@@ -804,6 +804,15 @@ class AgentRunner:
         self._clients[harness] = built
         return built
 
+    def set_config(self, config: ServiceConfig) -> None:
+        """Adopt a hot-reloaded config. New clients built afterward use it.
+
+        Already-cached clients keep the config they were constructed with;
+        a config change that requires rebuilding a client (e.g. a different
+        codex.command) only takes effect on the next process restart.
+        """
+        self._config = config
+
     async def startup_cleanup(self, workflow: WorkflowDefinition | None = None) -> None:
         harnesses = {self._config.agent.harness}
         if workflow is not None:

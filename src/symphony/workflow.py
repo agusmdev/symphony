@@ -11,7 +11,10 @@ from symphony.models import StateHandler, WorkflowDefinition
 
 SUPPORTED_HARNESSES = ("codex", "claude")
 _PROMPT_HEADER_RE = re.compile(r"^##\s+prompt:(\S+)\s*$")
-_FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})")
+# CommonMark: a fence may be indented up to 3 spaces. 4+ spaces is an
+# indented code block, NOT a fence — treating it as one trips a false
+# "unterminated_fence" for tutorial-style indented examples.
+_FENCE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})")
 
 
 class _DuplicateKeyLoader(yaml.SafeLoader):
@@ -24,7 +27,18 @@ def _construct_mapping(
     mapping: dict[Any, Any] = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
+        try:
+            already_present = key in mapping
+        except TypeError as exc:
+            # An unhashable key (list/dict/set under `? : value` syntax) would
+            # otherwise escape past load_workflow's `except yaml.YAMLError`.
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                f"unhashable mapping key: {exc}",
+                key_node.start_mark,
+            ) from exc
+        if already_present:
             raise yaml.constructor.ConstructorError(
                 None,
                 None,
